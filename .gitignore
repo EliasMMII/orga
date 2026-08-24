@@ -1,0 +1,22 @@
+# Virtuelle Python-Umgebung ignorieren (wichtig!)
+.venv/
+env/
+venv/
+ENV/
+
+# Python-Cache-Dateien ignorieren
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Generierte Ausgabedateien (PDFs und TXT-Rankings) ignorieren
+*.pdf
+ranking_*.txt
+
+# VS Code spezifische Ordner ignorieren
+.vscode/
+
+# Betriebssystem-Restmüll
+Thumbs.db
+.DS_Store
