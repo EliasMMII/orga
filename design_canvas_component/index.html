@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<style>
+  html, body { margin: 0; padding: 0; font-family: sans-serif; font-size: 13px; background: #f0f2f6; }
+  #app { padding: 8px; }
+  .toolbar-row {
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px;
+  }
+  .toolbar-row.hidden { display: none; }
+  .toolbar-row button, .toolbar-row select, .toolbar-row input[type=number], .toolbar-row input[type=color] {
+    padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; background: white;
+    cursor: pointer; font-size: 12px;
+  }
+  .toolbar-row button:hover { background: #eee; }
+  .toolbar-row button:disabled { opacity: 0.4; cursor: default; }
+  .toolbar-label { font-size: 11px; color: #555; margin-right: 2px; }
+  .sep { width: 1px; align-self: stretch; background: #ddd; margin: 2px 4px; }
+  #props-bar { background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 6px; padding: 8px; gap: 14px; }
+  #props-bar .group { display: flex; gap: 6px; align-items: flex-end; }
+  #props-bar .group.hidden { display: none; }
+  #props-bar label {
+    display: flex; flex-direction: column; font-size: 11px; color: #555; gap: 2px; cursor: default;
+  }
+  #props-bar label.hidden { display: none; }
+  #props-bar input[type=number] { width: 56px; }
+  #props-bar input, #props-bar select { cursor: pointer; }
+  #canvas-holder { border: 1px solid #ccc; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.15); display: inline-block; }
+  #hint { font-size: 11px; color: #888; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="toolbar-main" class="toolbar-row">
+    <button id="btn-add-text">+ Text</button>
+    <button id="btn-add-image">+ Bild</button>
+    <button id="btn-add-event-logo">+ Event-Logo</button>
+    <input type="file" id="file-input" accept="image/*" style="display:none">
+    <span class="sep"></span>
+    <button id="btn-delete">🗑 Löschen</button>
+    <button id="btn-front">Nach vorne</button>
+    <button id="btn-back">Nach hinten</button>
+  </div>
+
+  <div id="toolbar-align" class="toolbar-row">
+    <span class="toolbar-label">Ausrichten:</span>
+    <button class="align-btn" data-align="left" title="Linksbündig">⇤ Links</button>
+    <button class="align-btn" data-align="hcenter" title="Horizontal zentrieren">↔ Mitte</button>
+    <button class="align-btn" data-align="right" title="Rechtsbündig">⇥ Rechts</button>
+    <span class="sep"></span>
+    <button class="align-btn" data-align="top" title="Oben">⤒ Oben</button>
+    <button class="align-btn" data-align="vcenter" title="Vertikal zentrieren">↕ Mitte</button>
+    <button class="align-btn" data-align="bottom" title="Unten">⤓ Unten</button>
+  </div>
+  <div id="align-hint" class="toolbar-row">
+    <span class="toolbar-label" style="margin:0;">
+      Ein Element gewählt → an der Seite ausrichten. Mehrere gewählt (Shift+Klick) → zueinander ausrichten
+      (rasten beim Ziehen automatisch aneinander ein). Pfeiltasten verschieben die Auswahl (Shift = 10pt-Schritte).
+    </span>
+  </div>
+
+  <div id="props-bar" class="toolbar-row hidden">
+    <div id="props-position" class="group">
+      <label>X <input type="number" id="p-x" step="1"></label>
+      <label>Y <input type="number" id="p-y" step="1"></label>
+      <label>Breite <input type="number" id="p-width" step="1"></label>
+      <label id="p-height-label">Höhe <input type="number" id="p-height" step="1"></label>
+      <label>Winkel° <input type="number" id="p-angle" step="1"></label>
+    </div>
+    <div id="props-text" class="group hidden">
+      <label>Schriftart <select id="p-font"></select></label>
+      <label>Größe <input type="number" id="p-size" min="6" max="200"></label>
+      <label>Farbe <input type="color" id="p-color"></label>
+      <label>Ausrichtung
+        <select id="p-align">
+          <option value="left">Links</option>
+          <option value="center">Zentriert</option>
+          <option value="right">Rechts</option>
+        </select>
+      </label>
+    </div>
+    <div id="props-logo" class="group hidden">
+      <label>Logo-Farbe <input type="color" id="p-logo-color"></label>
+      <button id="btn-logo-color-reset" title="Original-SVG-Farben verwenden">Originalfarben</button>
+    </div>
+  </div>
+
+  <div id="canvas-holder"><canvas id="c"></canvas></div>
+  <div id="hint">Ziehen zum Verschieben, Ecken zum Skalieren, oberer Griff zum Drehen. Doppelklick auf Text zum Bearbeiten.</div>
+</div>
+
+<script src="fabric.min.js"></script>
+<script>
+// ---------------------------------------------------------------------
+// Minimaler Streamlit-Komponenten-Bridge (kein React/Build-Schritt nötig).
+// Protokoll verifiziert gegen streamlit-component-lib@2.0.0.
+// ---------------------------------------------------------------------
+var Streamlit = {
+  _lastHeight: null,
+  send: function (type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+  },
+  ready: function () {
+    Streamlit.send("streamlit:componentReady", { apiVersion: 1 });
+  },
+  setFrameHeight: function (height) {
+    if (height === undefined) height = document.body.scrollHeight;
+    if (height === Streamlit._lastHeight) return;
+    Streamlit._lastHeight = height;
+    Streamlit.send("streamlit:setFrameHeight", { height: height });
+  },
+  setValue: function (value) {
+    Streamlit.send("streamlit:setComponentValue", { value: value, dataType: "json" });
+  },
+  onRender: function (callback) {
+    window.addEventListener("message", function (event) {
+      var data = event.data || {};
+      if (data.type === "streamlit:render") {
+        callback(data.args || {});
+      }
+    });
+  }
+};
+
+// ---------------------------------------------------------------------
+// Canvas-Editor
+// ---------------------------------------------------------------------
+var canvas = null;
+var lastRevision = null;
+var fontFaceMap = {};
+var syncTimer = null;
+var idCounter = 0;
+var guideLines = [];
+
+var MAX_DISPLAY_WIDTH = 650;
+var MAX_DISPLAY_HEIGHT = 700;
+var SNAP_THRESHOLD_PX = 6;
+
+function newId() {
+  idCounter += 1;
+  return "layer_" + Date.now() + "_" + idCounter;
+}
+
+function cssFontFamily(fontId) {
+  var info = fontFaceMap[fontId];
+  return info ? info.cssFamily : "serif";
+}
+
+function cssFontWeight(fontId) {
+  var info = fontFaceMap[fontId];
+  return (info && info.weight) ? info.weight : "normal";
+}
+
+function cssFontStyle(fontId) {
+  var info = fontFaceMap[fontId];
+  return (info && info.style) ? info.style : "normal";
+}
+
+var loadedFontFamilies = {};
+
+function buildFontFaces(fontFaces) {
+  fontFaceMap = fontFaces || {};
+
+  // Eigene Web-Fonts (z. B. GreatVibes) über die FontFace-API laden, statt
+  // nur per @font-face-CSS einzubinden - so lässt sich per Promise auf den
+  // Ladeabschluss warten, bevor Textobjekte damit vermessen/gerendert
+  // werden (verhindert einen "Sprung", sobald die Schrift asynchron nachlädt).
+  var loadPromises = [];
+
+  Object.keys(fontFaceMap).forEach(function (fontId) {
+    var info = fontFaceMap[fontId];
+
+    if (info.dataUrl && !loadedFontFamilies[info.cssFamily]) {
+      try {
+        var fontFace = new FontFace(info.cssFamily, "url(" + info.dataUrl + ")");
+        document.fonts.add(fontFace);
+        loadedFontFamilies[info.cssFamily] = true;
+        loadPromises.push(fontFace.load().catch(function () {}));
+      } catch (err) {
+        // FontFace-API nicht verfügbar/fehlgeschlagen - Browser-Fallback greift weiterhin.
+      }
+    }
+  });
+
+  var select = document.getElementById("p-font");
+  select.innerHTML = "";
+  Object.keys(fontFaceMap).forEach(function (fontId) {
+    var opt = document.createElement("option");
+    opt.value = fontId;
+    opt.textContent = fontFaceMap[fontId].label || fontId;
+    select.appendChild(opt);
+  });
+
+  return Promise.all(loadPromises);
+}
+
+function buildCanvas(args) {
+  if (canvas) {
+    canvas.dispose();
+    canvas = null;
+  }
+
+  guideLines = [];
+
+  var pageWidth = args.pageWidth;
+  var pageHeight = args.pageHeight;
+  var zoom = Math.min(MAX_DISPLAY_WIDTH / pageWidth, MAX_DISPLAY_HEIGHT / pageHeight);
+  var displayWidth = pageWidth * zoom;
+  var displayHeight = pageHeight * zoom;
+
+  var el = document.getElementById("c");
+  canvas = new fabric.Canvas(el, {
+    selection: true,
+    preserveObjectStacking: true
+  });
+  canvas.setDimensions({ width: displayWidth, height: displayHeight });
+  canvas.setZoom(zoom);
+  canvas.__pageWidth = pageWidth;
+  canvas.__pageHeight = pageHeight;
+
+  if (args.backgroundDataUrl) {
+    fabric.Image.fromURL(args.backgroundDataUrl, function (img) {
+      img.set({
+        left: 0, top: 0,
+        scaleX: pageWidth / img.width,
+        scaleY: pageHeight / img.height,
+        selectable: false, evented: false
+      });
+      canvas.setBackgroundImage(img, canvas.renderAll.bind(canvas));
+    }, { crossOrigin: "anonymous" });
+  }
+
+  (args.initialLayers || []).forEach(function (layer) {
+    addLayerToCanvas(layer, true);
+  });
+
+  canvas.on("object:modified", scheduleSync);
+  canvas.on("object:added", scheduleSync);
+  canvas.on("object:removed", scheduleSync);
+  canvas.on("text:changed", scheduleSync);
+  canvas.on("object:moving", function (e) {
+    snapObjectPosition(e.target);
+    updatePropsBar();
+  });
+  canvas.on("mouse:up", function () {
+    clearGuides();
+    canvas.requestRenderAll();
+  });
+  canvas.on("selection:created", onSelectionChanged);
+  canvas.on("selection:updated", onSelectionChanged);
+  canvas.on("selection:cleared", onSelectionChanged);
+
+  canvas.requestRenderAll();
+  onSelectionChanged();
+  Streamlit.setFrameHeight(displayHeight + 200);
+}
+
+function addLayerToCanvas(layer, fromInitial) {
+  if (layer.type === "text") {
+    var textbox = new fabric.Textbox(layer.content || "Text", {
+      left: layer.x || 20,
+      top: layer.y || 20,
+      width: layer.width || 200,
+      fontFamily: cssFontFamily(layer.font),
+      fontWeight: cssFontWeight(layer.font),
+      fontStyle: cssFontStyle(layer.font),
+      fontSize: layer.size || 24,
+      fill: layer.color || "#000000",
+      textAlign: layer.align || "left",
+      angle: layer.angle || 0,
+      cornerStyle: "circle",
+      transparentCorners: false
+    });
+    textbox.__id = layer.id || newId();
+    textbox.__fontId = layer.font || Object.keys(fontFaceMap)[0];
+    textbox.__layerType = "text";
+    canvas.add(textbox);
+  } else if (layer.type === "image" && layer.src) {
+    fabric.Image.fromURL(layer.src, function (img) {
+      img.set({
+        left: layer.x || 20,
+        top: layer.y || 20,
+        angle: layer.angle || 0,
+        cornerStyle: "circle",
+        transparentCorners: false
+      });
+      if (layer.width) img.scaleToWidth(layer.width);
+      if (layer.height) img.scaleToHeight(layer.height);
+      img.__id = layer.id || newId();
+      img.__layerType = "image";
+      img.__src = layer.src;
+      canvas.add(img);
+      if (!fromInitial) canvas.setActiveObject(img);
+      scheduleSync();
+    }, { crossOrigin: "anonymous" });
+  } else if (layer.type === "event_logo") {
+    var width = layer.width || 30;
+    var height = layer.height || 30;
+    var rectFill = layer.color ? (layer.color + "55") : "rgba(200,200,200,0.35)";
+    var rect = new fabric.Rect({
+      width: width, height: height,
+      fill: rectFill, stroke: "#999", strokeDashArray: [4, 4],
+      originX: "left", originY: "top"
+    });
+    var label = new fabric.Text("EVENT-\nLOGO", {
+      fontSize: 9, fill: "#666", textAlign: "center",
+      originX: "center", originY: "center",
+      left: width / 2, top: height / 2
+    });
+    var group = new fabric.Group([rect, label], {
+      left: layer.x || 40,
+      top: layer.y || 40,
+      angle: layer.angle || 0,
+      cornerStyle: "circle",
+      transparentCorners: false
+    });
+    group.__id = layer.id || newId();
+    group.__layerType = "event_logo";
+    group.__color = layer.color || null;
+    canvas.add(group);
+    if (!fromInitial) canvas.setActiveObject(group);
+  }
+}
+
+function scheduleSync() {
+  if (syncTimer) clearTimeout(syncTimer);
+  syncTimer = setTimeout(syncToStreamlit, 250);
+}
+
+function syncToStreamlit() {
+  if (!canvas) return;
+  var layers = canvas.getObjects().filter(function (obj) {
+    return !obj.__isGuide;
+  }).map(function (obj) {
+    var base = {
+      id: obj.__id || (obj.__id = newId()),
+      x: obj.left,
+      y: obj.top,
+      angle: obj.angle || 0
+    };
+    if (obj.__layerType === "text") {
+      base.type = "text";
+      base.content = obj.text;
+      base.width = obj.width * obj.scaleX;
+      base.height = obj.height * obj.scaleY;
+      base.font = obj.__fontId;
+      base.size = obj.fontSize;
+      base.color = obj.fill;
+      base.align = obj.textAlign;
+    } else if (obj.__layerType === "image") {
+      base.type = "image";
+      base.width = obj.getScaledWidth();
+      base.height = obj.getScaledHeight();
+      base.src = obj.__src;
+    } else if (obj.__layerType === "event_logo") {
+      base.type = "event_logo";
+      base.width = obj.getScaledWidth();
+      base.height = obj.getScaledHeight();
+      base.color = obj.__color || null;
+    }
+    return base;
+  });
+  Streamlit.setValue({ layers: layers });
+}
+
+// --- Einrasten an anderen Elementen / an der Seite (wie Canva) ---
+
+function clearGuides() {
+  guideLines.forEach(function (l) { canvas.remove(l); });
+  guideLines = [];
+}
+
+function addGuideLine(x1, y1, x2, y2) {
+  var line = new fabric.Line([x1, y1, x2, y2], {
+    stroke: "#ff4081",
+    strokeWidth: 1 / canvas.getZoom(),
+    selectable: false,
+    evented: false
+  });
+  line.__isGuide = true;
+  canvas.add(line);
+  guideLines.push(line);
+}
+
+function snapObjectPosition(target) {
+  clearGuides();
+
+  var zoom = canvas.getZoom();
+  var threshold = SNAP_THRESHOLD_PX / zoom;
+
+  var rect = target.getBoundingRect(true, true);
+  var tLeft = rect.left, tRight = rect.left + rect.width, tCenterX = rect.left + rect.width / 2;
+  var tTop = rect.top, tBottom = rect.top + rect.height, tCenterY = rect.top + rect.height / 2;
+
+  var xCandidates = [
+    { value: 0 }, { value: canvas.__pageWidth / 2 }, { value: canvas.__pageWidth }
+  ];
+  var yCandidates = [
+    { value: 0 }, { value: canvas.__pageHeight / 2 }, { value: canvas.__pageHeight }
+  ];
+
+  canvas.getObjects().forEach(function (obj) {
+    if (obj === target || obj.__isGuide) return;
+    var r = obj.getBoundingRect(true, true);
+    xCandidates.push({ value: r.left }, { value: r.left + r.width / 2 }, { value: r.left + r.width });
+    yCandidates.push({ value: r.top }, { value: r.top + r.height / 2 }, { value: r.top + r.height });
+  });
+
+  var bestDx = null, bestDxDist = threshold, bestDxGuideVal = null;
+  [tLeft, tCenterX, tRight].forEach(function (edgeVal) {
+    xCandidates.forEach(function (c) {
+      var d = Math.abs(edgeVal - c.value);
+      if (d < bestDxDist) {
+        bestDxDist = d;
+        bestDx = c.value - edgeVal;
+        bestDxGuideVal = c.value;
+      }
+    });
+  });
+
+  var bestDy = null, bestDyDist = threshold, bestDyGuideVal = null;
+  [tTop, tCenterY, tBottom].forEach(function (edgeVal) {
+    yCandidates.forEach(function (c) {
+      var d = Math.abs(edgeVal - c.value);
+      if (d < bestDyDist) {
+        bestDyDist = d;
+        bestDy = c.value - edgeVal;
+        bestDyGuideVal = c.value;
+      }
+    });
+  });
+
+  if (bestDx !== null) {
+    target.left += bestDx;
+    addGuideLine(bestDxGuideVal, -2000, bestDxGuideVal, 2000);
+  }
+  if (bestDy !== null) {
+    target.top += bestDy;
+    addGuideLine(-2000, bestDyGuideVal, 2000, bestDyGuideVal);
+  }
+
+  target.setCoords();
+}
+
+// --- Auswahl / Eigenschaften-Leiste ---
+
+function onSelectionChanged() {
+  clearGuides();
+  updatePropsBar();
+  updateAlignButtons();
+}
+
+function updatePropsBar() {
+  var bar = document.getElementById("props-bar");
+  var obj = canvas.getActiveObject();
+
+  if (!obj || canvas.getActiveObjects().length > 1) {
+    bar.classList.add("hidden");
+    return;
+  }
+
+  bar.classList.remove("hidden");
+
+  document.getElementById("p-x").value = Math.round(obj.left);
+  document.getElementById("p-y").value = Math.round(obj.top);
+  document.getElementById("p-width").value = Math.round(obj.getScaledWidth());
+  document.getElementById("p-angle").value = Math.round(obj.angle || 0);
+
+  var textGroup = document.getElementById("props-text");
+  var logoGroup = document.getElementById("props-logo");
+  var heightLabel = document.getElementById("p-height-label");
+
+  if (obj.__layerType === "text") {
+    textGroup.classList.remove("hidden");
+    logoGroup.classList.add("hidden");
+    heightLabel.classList.add("hidden");
+
+    document.getElementById("p-font").value = obj.__fontId;
+    document.getElementById("p-size").value = obj.fontSize;
+    document.getElementById("p-color").value = obj.fill;
+    document.getElementById("p-align").value = obj.textAlign;
+  } else {
+    textGroup.classList.add("hidden");
+    heightLabel.classList.remove("hidden");
+    document.getElementById("p-height").value = Math.round(obj.getScaledHeight());
+
+    if (obj.__layerType === "event_logo") {
+      logoGroup.classList.remove("hidden");
+      document.getElementById("p-logo-color").value = obj.__color || "#000000";
+    } else {
+      logoGroup.classList.add("hidden");
+    }
+  }
+}
+
+function updateAlignButtons() {
+  var hasSelection = !!canvas.getActiveObject();
+  document.querySelectorAll(".align-btn").forEach(function (btn) {
+    btn.disabled = !hasSelection;
+  });
+}
+
+// --- Ausrichten (an der Seite bei Einzelauswahl, zueinander bei Mehrfachauswahl) ---
+
+function alignSelection(mode) {
+  var active = canvas.getActiveObject();
+  if (!active) return;
+
+  var objects = active.type === "activeSelection" ? active.getObjects().slice() : [active];
+  if (objects.length === 0) return;
+
+  var rects = objects.map(function (obj) { return obj.getBoundingRect(true, true); });
+
+  var singleObject = objects.length === 1;
+
+  var boundsLeft = singleObject ? 0 : Math.min.apply(null, rects.map(function (r) { return r.left; }));
+  var boundsRight = singleObject ? canvas.__pageWidth : Math.max.apply(null, rects.map(function (r) { return r.left + r.width; }));
+  var boundsTop = singleObject ? 0 : Math.min.apply(null, rects.map(function (r) { return r.top; }));
+  var boundsBottom = singleObject ? canvas.__pageHeight : Math.max.apply(null, rects.map(function (r) { return r.top + r.height; }));
+
+  if (active.type === "activeSelection") {
+    canvas.discardActiveObject();
+  }
+
+  objects.forEach(function (obj, i) {
+    var rect = rects[i];
+    var dx = 0;
+    var dy = 0;
+
+    if (mode === "left") dx = boundsLeft - rect.left;
+    else if (mode === "hcenter") dx = (boundsLeft + boundsRight) / 2 - (rect.left + rect.width / 2);
+    else if (mode === "right") dx = boundsRight - (rect.left + rect.width);
+    else if (mode === "top") dy = boundsTop - rect.top;
+    else if (mode === "vcenter") dy = (boundsTop + boundsBottom) / 2 - (rect.top + rect.height / 2);
+    else if (mode === "bottom") dy = boundsBottom - (rect.top + rect.height);
+
+    obj.set({ left: obj.left + dx, top: obj.top + dy });
+    obj.setCoords();
+  });
+
+  canvas.requestRenderAll();
+  updatePropsBar();
+  scheduleSync();
+}
+
+document.querySelectorAll(".align-btn").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    alignSelection(btn.getAttribute("data-align"));
+  });
+});
+
+// --- Positions-/Größenfelder ---
+
+function applyPositionFields() {
+  var obj = canvas.getActiveObject();
+  if (!obj || canvas.getActiveObjects().length > 1) return;
+
+  var x = parseFloat(document.getElementById("p-x").value);
+  var y = parseFloat(document.getElementById("p-y").value);
+  var w = parseFloat(document.getElementById("p-width").value);
+  var h = parseFloat(document.getElementById("p-height").value);
+  var angle = parseFloat(document.getElementById("p-angle").value);
+
+  if (!isNaN(x)) obj.set({ left: x });
+  if (!isNaN(y)) obj.set({ top: y });
+  if (!isNaN(angle)) obj.set({ angle: angle });
+
+  if (!isNaN(w) && w > 0) {
+    if (obj.__layerType === "text") obj.set({ width: w });
+    else obj.scaleToWidth(w);
+  }
+  if (!isNaN(h) && h > 0 && obj.__layerType !== "text") {
+    obj.scaleToHeight(h);
+  }
+
+  obj.setCoords();
+  canvas.requestRenderAll();
+  scheduleSync();
+}
+
+["p-x", "p-y", "p-width", "p-height", "p-angle"].forEach(function (id) {
+  document.getElementById(id).addEventListener("input", applyPositionFields);
+});
+
+document.getElementById("p-logo-color").addEventListener("input", function () {
+  var obj = canvas.getActiveObject();
+  if (!obj || obj.__layerType !== "event_logo") return;
+  obj.__color = this.value;
+  var rectChild = obj._objects && obj._objects[0];
+  if (rectChild) rectChild.set({ fill: this.value + "55" });
+  canvas.requestRenderAll();
+  scheduleSync();
+});
+
+document.getElementById("btn-logo-color-reset").addEventListener("click", function () {
+  var obj = canvas.getActiveObject();
+  if (!obj || obj.__layerType !== "event_logo") return;
+  obj.__color = null;
+  var rectChild = obj._objects && obj._objects[0];
+  if (rectChild) rectChild.set({ fill: "rgba(200,200,200,0.35)" });
+  document.getElementById("p-logo-color").value = "#000000";
+  canvas.requestRenderAll();
+  scheduleSync();
+});
+
+// --- Toolbar-Aktionen ---
+
+document.getElementById("btn-add-text").addEventListener("click", function () {
+  addLayerToCanvas({
+    type: "text", content: "Neuer Text", x: 40, y: 40, width: 200,
+    font: Object.keys(fontFaceMap)[0], size: 24, color: "#000000", align: "left"
+  });
+  scheduleSync();
+});
+
+document.getElementById("btn-add-image").addEventListener("click", function () {
+  document.getElementById("file-input").click();
+});
+
+document.getElementById("btn-add-event-logo").addEventListener("click", function () {
+  addLayerToCanvas({ type: "event_logo", x: 40, y: 40, width: 30, height: 30 });
+  scheduleSync();
+});
+
+document.getElementById("file-input").addEventListener("change", function (e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function (evt) {
+    addLayerToCanvas({ type: "image", src: evt.target.result, x: 40, y: 40, width: 150 });
+  };
+  reader.readAsDataURL(file);
+  e.target.value = "";
+});
+
+document.getElementById("btn-delete").addEventListener("click", function () {
+  var objs = canvas.getActiveObjects();
+  objs.forEach(function (o) { canvas.remove(o); });
+  canvas.discardActiveObject();
+  canvas.requestRenderAll();
+  scheduleSync();
+});
+
+document.getElementById("btn-front").addEventListener("click", function () {
+  var obj = canvas.getActiveObject();
+  if (obj) { canvas.bringToFront(obj); scheduleSync(); }
+});
+
+document.getElementById("btn-back").addEventListener("click", function () {
+  var obj = canvas.getActiveObject();
+  if (obj) { canvas.sendToBack(obj); scheduleSync(); }
+});
+
+["p-font", "p-size", "p-color", "p-align"].forEach(function (id) {
+  document.getElementById(id).addEventListener("input", function () {
+    var obj = canvas.getActiveObject();
+    if (!obj || obj.__layerType !== "text") return;
+    obj.set({
+      fontFamily: cssFontFamily(document.getElementById("p-font").value),
+      fontWeight: cssFontWeight(document.getElementById("p-font").value),
+      fontStyle: cssFontStyle(document.getElementById("p-font").value),
+      fontSize: parseInt(document.getElementById("p-size").value, 10) || obj.fontSize,
+      fill: document.getElementById("p-color").value,
+      textAlign: document.getElementById("p-align").value
+    });
+    obj.__fontId = document.getElementById("p-font").value;
+    canvas.requestRenderAll();
+    scheduleSync();
+  });
+});
+
+document.addEventListener("keydown", function (e) {
+  if (!canvas) return;
+
+  var activeEl = document.activeElement;
+  var isTypingInField = activeEl && (
+    activeEl.tagName === "INPUT" || activeEl.tagName === "SELECT" || activeEl.tagName === "TEXTAREA"
+  );
+  var activeObj = canvas.getActiveObject();
+  var isEditingText = activeObj && activeObj.isEditing;
+
+  if (isEditingText || isTypingInField) return;
+
+  if (e.key === "Delete" || e.key === "Backspace") {
+    var objs = canvas.getActiveObjects();
+    if (objs.length) {
+      objs.forEach(function (o) { canvas.remove(o); });
+      canvas.discardActiveObject();
+      canvas.requestRenderAll();
+      scheduleSync();
+      e.preventDefault();
+    }
+    return;
+  }
+
+  var arrowSteps = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+  var d = arrowSteps[e.key];
+
+  if (d && activeObj) {
+    var step = e.shiftKey ? 10 : 1;
+    activeObj.set({
+      left: activeObj.left + d[0] * step,
+      top: activeObj.top + d[1] * step
+    });
+    activeObj.setCoords();
+    canvas.requestRenderAll();
+    updatePropsBar();
+    scheduleSync();
+    e.preventDefault();
+  }
+});
+
+// --- Streamlit render loop ---
+
+Streamlit.onRender(function (args) {
+  var fontsReady = buildFontFaces(args.fontFaces);
+
+  if (args.revision !== lastRevision) {
+    lastRevision = args.revision;
+    fontsReady.then(function () {
+      buildCanvas(args);
+    });
+  } else {
+    fontsReady.then(function () {
+      if (canvas) canvas.requestRenderAll();
+    });
+  }
+});
+
+Streamlit.ready();
+Streamlit.setFrameHeight();
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+pillow
+pymupdf
+pypdf
+reportlab
+requests
+streamlit
+svglib

@@ -1,27 +1,22 @@
 import os
 import sys
-import requests
 import re
+import base64
 
 from io import BytesIO
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from svglib.svglib import svg2rlg
 from reportlab.graphics import renderPDF
 
-
-# ==========================================
-# KONFIGURATION FÜR DEN HINTERGRUND
-# ==========================================
-# True  = Nutzt das PDF-Template (TEMPLATE_PDF_PATH)
-# False = Nutzt einen rein weißen Hintergrund
-USE_TEMPLATE_PDF = False
+import wca_common
+import design_store
 
 
-TEMPLATE_PDF_PATH = os.path.join("assets", "Urkunde_leer.pdf")
 SVG_DIR = os.path.join("assets", "svgs")
 OUTPUT_DIR = "Urkunden_Gesamt"
 FONT_PATH = os.path.join("fonts", "GreatVibes-Regular.ttf")
@@ -29,35 +24,8 @@ FONT_PATH = os.path.join("fonts", "GreatVibes-Regular.ttf")
 
 if os.path.exists(FONT_PATH):
     pdfmetrics.registerFont(TTFont("GreatVibes", FONT_PATH))
-    NAME_FONT = "GreatVibes"
 else:
     print(f"WARNUNG: Schriftart '{FONT_PATH}' nicht gefunden.")
-    NAME_FONT = "Times-Italic"
-
-
-EVENT_NAMES = {
-    "333": "3x3",
-    "222": "2x2",
-    "444": "4x4",
-    "555": "5x5",
-    "666": "6x6",
-    "777": "7x7",
-    "333bf": "3x3 Blind",
-    "333fm": "Fewest Moves",
-    "333oh": "3x3 One-Handed",
-    "clock": "Clock",
-    "minx": "Megaminx",
-    "pyram": "Pyraminx",
-    "skewb": "Skewb",
-    "sq1": "Square-1",
-    "444bf": "4x4 Blind",
-    "555bf": "5x5 Blind",
-    "333mbf": "3x3 Multi-Blind"
-}
-
-
-def get_event_name(event_id):
-    return EVENT_NAMES.get(event_id.lower(), event_id.upper())
 
 
 def clean_name(name):
@@ -69,62 +37,11 @@ def clean_name(name):
     return cleaned.strip()
 
 
-def format_wca_time(centiseconds, event_id):
-    """Konvertiert WCA-Ergebnisse in ein lesbares Format."""
-    if not centiseconds or centiseconds == 99999999 or centiseconds <= 0:
-        return "Newcomer"
-
-    if event_id == "333mbf":
-        val_str = str(centiseconds).zfill(9)
-
-        points_diff = 99 - int(val_str[0:2])
-        time_seconds = int(val_str[2:7])
-        missed = int(val_str[7:9])
-
-        solved = points_diff + missed
-        attempted = solved + missed
-
-        if time_seconds == 99999:
-            time_str = "N/A"
-        else:
-            hours = time_seconds // 3600
-            minutes = (time_seconds % 3600) // 60
-            seconds = time_seconds % 60
-
-            if hours > 0:
-                time_str = f"{hours}:{minutes:02d}:{seconds:02d}"
-            else:
-                time_str = f"{minutes:02d}:{seconds:02d}"
-
-        return f"{solved}/{attempted} in {time_str}"
-
-    seconds = centiseconds / 100.0
-
-    if seconds >= 60:
-        minutes = int(seconds // 60)
-        rem_seconds = seconds % 60
-        return f"{minutes}:{rem_seconds:05.2f}"
-
-    return f"{seconds:.2f}"
-
-
 def get_competition_data(competition_id, event_id):
-    url = (
-        f"https://worldcubeassociation.org/api/v0/"
-        f"competitions/{competition_id}/wcif/public"
-    )
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 WCA Certificate Generator"
-    }
-
     print(f"Lade Daten für Competition '{competition_id}'...")
 
     try:
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
-        wcif_data = response.json()
-
+        wcif_data = wca_common.fetch_wcif(competition_id)
     except Exception as e:
         print(f"FEHLER beim Laden der WCA-Daten: {e}")
         return None, None
@@ -162,14 +79,46 @@ def get_competition_data(competition_id, event_id):
     final_round = rounds[-1]
     results = final_round.get("results", [])
 
-    entries = []
+    try:
+        live_data = wca_common.fetch_live_round_results(
+            competition_id,
+            wcif_data.get("name", competition_id),
+            event_id
+        )
+    except Exception as e:
+        live_data = None
+        print(f"Hinweis: WCA Live nicht erreichbar ({e}), nutze WCA-Ergebnisse.")
 
-    blind_events = [
-        "333bf",
-        "444bf",
-        "555bf",
-        "333mbf"
-    ]
+    if live_data:
+        live_results, round_finished = live_data
+
+        if live_results:
+            print("Nutze Live-Ergebnisse von WCA Live (aktueller als die WCA-Synchronisierung).")
+
+            results = []
+
+            for live_result in live_results:
+                person = live_result.get("person") or {}
+                person_id = person.get("registrantId")
+
+                results.append({
+                    "ranking": live_result.get("ranking"),
+                    "personId": person_id,
+                    "best": live_result.get("best"),
+                    "average": live_result.get("average")
+                })
+
+                if person_id is not None:
+                    persons[person_id] = {
+                        "name": clean_name(person.get("name", "Unbekannt")),
+                        "country": (person.get("country") or {}).get("iso2"),
+                        "wca_id": person.get("wcaId")
+                    }
+
+            if not round_finished:
+                print("WARNUNG: Die Runde ist laut WCA Live noch nicht als abgeschlossen markiert.")
+
+    entries = []
 
     for result in results:
         ranking = result.get("ranking")
@@ -188,7 +137,7 @@ def get_competition_data(competition_id, event_id):
             }
         )
 
-        if event_id in blind_events:
+        if wca_common.is_blind_event(event_id):
             raw_result = result.get("best", 0)
             result_type = "best"
         else:
@@ -204,7 +153,7 @@ def get_competition_data(competition_id, event_id):
             "country": person["country"],
             "wca_id": person["wca_id"],
             "actual_rank": ranking,
-            "result": format_wca_time(raw_result, event_id),
+            "result": wca_common.format_wca_time(raw_result, event_id, mbf_order="certificate"),
             "result_type": result_type
         })
 
@@ -267,12 +216,20 @@ def get_recipients(entries, country_code=None):
     return recipients
 
 
-def draw_centered_text(c, text, y, font_name, font_size):
-    c.setFont(font_name, font_size)
-    c.drawCentredString(595.5 / 2, y, text)
+def _recolor_drawing(node, color):
+    """Überschreibt rekursiv alle gesetzten Füll-/Strichfarben eines
+    svglib-Drawings mit einer einheitlichen Farbe (einfaches Icon-Recolor)."""
+    if getattr(node, "fillColor", None) is not None:
+        node.fillColor = color
+
+    if getattr(node, "strokeColor", None) is not None:
+        node.strokeColor = color
+
+    for child in getattr(node, "contents", []):
+        _recolor_drawing(child, color)
 
 
-def draw_event_logo(c, event_id, center_x, center_y, size=30):
+def draw_event_logo(c, event_id, center_x, center_y, size=30, color=None):
     svg_path = os.path.join(SVG_DIR, f"{event_id}.svg")
 
     if not os.path.exists(svg_path):
@@ -284,6 +241,9 @@ def draw_event_logo(c, event_id, center_x, center_y, size=30):
 
         if not drawing:
             return
+
+        if color:
+            _recolor_drawing(drawing, colors.HexColor(color))
 
         scale = min(
             size / drawing.width,
@@ -306,169 +266,159 @@ def draw_event_logo(c, event_id, center_x, center_y, size=30):
         print(f"WARNUNG: Event-Logo konnte nicht geladen werden: {e}")
 
 
-def create_overlay_pdf(
-    name,
-    competition_name,
-    event_id,
-    certificate_rank,
-    result
-):
+def _safe_set_font(c, font_name, font_size):
+    """Setzt die Schriftart, fällt bei nicht registrierten Schriften (z. B.
+    fehlende GreatVibes-Datei) auf Times-Roman zurück."""
+    try:
+        c.setFont(font_name, font_size)
+        return font_name
+    except KeyError:
+        c.setFont("Times-Roman", font_size)
+        return "Times-Roman"
+
+
+def _default_result_label(event_id):
+    if event_id in ("333bf", "444bf", "555bf"):
+        return "mit einer Zeit von:"
+    if event_id == "333mbf":
+        return "mit einem Ergebnis von:"
+    return "mit einem Durchschnitt von:"
+
+
+def render_urkunde_overlay(design, context):
+    """Rendert eine Urkunden-Seite (Overlay) anhand eines frei gestalteten
+    Design-Entwurfs (design_store.get_urkunde_design: page, background,
+    layers) und der dynamischen Werte in context (name, rank, event,
+    event_id, competition, result).
+
+    Layer-Koordinaten (x/y/width/height) sind wie im Canvas-Editor von der
+    linken oberen Seitenecke aus gemessen (y wächst nach unten) und werden
+    hier ins PDF-Koordinatensystem (Ursprung unten links) umgerechnet.
+    """
     packet = BytesIO()
 
-    page_width = 595.5
-    page_height = 842.25
+    page = design.get("page") or {}
+    page_width = page.get("width", 595.5)
+    page_height = page.get("height", 842.25)
 
-    c = canvas.Canvas(
-        packet,
-        pagesize=(page_width, page_height)
-    )
+    c = canvas.Canvas(packet, pagesize=(page_width, page_height))
 
-    c.setFillColor(colors.HexColor("#161616"))
+    background = design.get("background") or {}
 
-    max_name_width = 470
-    name_font_size = 48
-    min_name_font_size = 28
+    if background.get("type") == "image":
+        # "data" sind rohe Bild-Bytes (z. B. für eine Live-Vorschau ohne
+        # Festplatten-Umweg), "path" ein gespeicherter Hintergrund.
+        image_source = background.get("data")
 
-    while (
-        c.stringWidth(name, NAME_FONT, name_font_size)
-        > max_name_width
-        and name_font_size > min_name_font_size
-    ):
-        name_font_size -= 1
+        if image_source is None and background.get("path") and os.path.exists(background["path"]):
+            image_source = background["path"]
 
-    draw_centered_text(
-        c,
-        name,
-        445,
-        NAME_FONT,
-        name_font_size
-    )
+        if image_source is not None:
+            try:
+                source = ImageReader(BytesIO(image_source)) if isinstance(image_source, (bytes, bytearray)) else image_source
 
-    draw_centered_text(
-        c,
-        "zum",
-        397,
-        "Times-Roman",
-        20
-    )
+                c.drawImage(
+                    source, 0, 0,
+                    width=page_width, height=page_height,
+                    preserveAspectRatio=False, mask='auto'
+                )
+            except Exception as e:
+                print(f"WARNUNG: Hintergrundbild konnte nicht geladen werden: {e}")
 
-    draw_centered_text(
-        c,
-        f"{certificate_rank}. PLATZ",
-        335,
-        "Times-Roman",
-        31
-    )
+    event_id = context.get("event_id", "")
+    context = dict(context)
+    context.setdefault("result_label", _default_result_label(event_id))
 
-    event_name = get_event_name(event_id)
-    event_text = f"in {event_name}"
-    event_font_size = 22
+    for layer in design.get("layers", []):
+        layer_type = layer.get("type")
+        x = layer.get("x", 0)
+        y = layer.get("y", 0)
+        width = layer.get("width", 0)
+        height = layer.get("height", 0)
+        angle = layer.get("angle", 0) or 0
 
-    c.setFont("Times-Roman", event_font_size)
+        box_center_x = x + width / 2
+        box_center_y_pdf = page_height - y - height / 2
 
-    text_width = c.stringWidth(
-        event_text,
-        "Times-Roman",
-        event_font_size
-    )
+        if layer_type == "event_logo":
+            size = max(width, height) or 26
+            draw_event_logo(c, event_id, box_center_x, box_center_y_pdf, size, color=layer.get("color"))
+            continue
 
-    logo_size = 26
-    logo_gap = 8
+        if layer_type == "image":
+            image_source = None
 
-    total_width = text_width + logo_gap + logo_size
-    start_x = (page_width - total_width) / 2
+            if layer.get("path") and os.path.exists(layer["path"]):
+                image_source = layer["path"]
+            elif str(layer.get("src", "")).startswith("data:"):
+                try:
+                    _, encoded = layer["src"].split(",", 1)
+                    image_source = ImageReader(BytesIO(base64.b64decode(encoded)))
+                except Exception:
+                    image_source = None
 
-    c.drawString(
-        start_x,
-        273,
-        event_text
-    )
+            if image_source is None:
+                continue
 
-    draw_event_logo(
-        c,
-        event_id,
-        start_x + text_width + logo_gap + logo_size / 2,
-        281,
-        logo_size
-    )
+            try:
+                c.saveState()
+                c.translate(box_center_x, box_center_y_pdf)
+                if angle:
+                    c.rotate(-angle)
+                c.drawImage(
+                    image_source, -width / 2, -height / 2,
+                    width=width, height=height, mask='auto'
+                )
+                c.restoreState()
+            except Exception as e:
+                print(f"WARNUNG: Bild-Layer konnte nicht geladen werden: {e}")
 
-    competition_prefix = "bei den "
-    competition_font_size = 21
+            continue
 
-    c.setFont(
-        "Times-Roman",
-        competition_font_size
-    )
+        if layer_type != "text":
+            continue
 
-    prefix_width = c.stringWidth(
-        competition_prefix,
-        "Times-Roman",
-        competition_font_size
-    )
+        try:
+            text = (layer.get("content") or "").format(**context)
+        except Exception:
+            text = layer.get("content") or ""
 
-    c.setFont(
-        "Times-Bold",
-        competition_font_size
-    )
+        if not text:
+            continue
 
-    competition_width = c.stringWidth(
-        competition_name,
-        "Times-Bold",
-        competition_font_size
-    )
+        font_name = layer.get("font", "Times-Roman")
+        font_size = layer.get("size", 20)
+        align = layer.get("align", "left")
 
-    total_width = prefix_width + competition_width
-    start_x = (page_width - total_width) / 2
+        # Grobe Näherung der Schrift-Oberkante, da Browser (Canvas-Editor)
+        # und reportlab (PDF) Text unterschiedlich vermessen - die "Vorschau
+        # aktualisieren"-Funktion zeigt das exakte PDF-Ergebnis.
+        ascent = font_size * 0.8
+        baseline_pdf_y = page_height - y - ascent
 
-    c.setFont(
-        "Times-Roman",
-        competition_font_size
-    )
+        anchor_x = x
+        if align == "center":
+            anchor_x = x + width / 2
+        elif align == "right":
+            anchor_x = x + width
 
-    c.drawString(
-        start_x,
-        223,
-        competition_prefix
-    )
+        _safe_set_font(c, font_name, font_size)
+        c.setFillColor(colors.HexColor(layer.get("color", "#000000")))
 
-    c.setFont(
-        "Times-Bold",
-        competition_font_size
-    )
+        c.saveState()
+        c.translate(box_center_x, box_center_y_pdf)
+        if angle:
+            c.rotate(-angle)
+        c.translate(anchor_x - box_center_x, baseline_pdf_y - box_center_y_pdf)
 
-    c.drawString(
-        start_x + prefix_width,
-        223,
-        competition_name
-    )
+        if align == "center":
+            c.drawCentredString(0, 0, text)
+        elif align == "right":
+            c.drawRightString(0, 0, text)
+        else:
+            c.drawString(0, 0, text)
 
-    if event_id in ["333bf", "444bf", "555bf"]:
-        result_label = "mit einer Zeit von:"
-    elif event_id == "333mbf":
-        result_label = "mit einem Ergebnis von:"
-    else:
-        result_label = "mit einem Durchschnitt von:"
-
-    draw_centered_text(
-        c,
-        result_label,
-        179,
-        "Times-Roman",
-        20
-    )
-
-    if event_id == "333mbf":
-        result_text = result
-    else:
-        result_text = f"{result}"
-
-    draw_centered_text(
-        c,
-        result_text,
-        133,
-        "Times-Roman",
-        20
-    )
+        c.restoreState()
 
     c.save()
     packet.seek(0)
@@ -501,12 +451,6 @@ def main():
     if len(sys.argv) == 4:
         country_code = sys.argv[3].upper()
 
-    if USE_TEMPLATE_PDF and not os.path.exists(TEMPLATE_PDF_PATH):
-        print(
-            f"FEHLER: Vorlage nicht gefunden: {TEMPLATE_PDF_PATH}"
-        )
-        return
-
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     wcif_data, entries = get_competition_data(
@@ -534,7 +478,7 @@ def main():
 
     print()
     print("=" * 60)
-    print(f"GENERIERUNG FÜR: {get_event_name(event_id)}")
+    print(f"GENERIERUNG FÜR: {wca_common.get_event_name(event_id)}")
 
     if country_code:
         print(f"Länderpodium: {country_code}")
@@ -544,24 +488,24 @@ def main():
     print(f"Anzahl Urkunden: {len(recipients)}")
     print("=" * 60)
 
+    design = design_store.get_urkunde_design(competition_id)
+
     writer = PdfWriter()
 
     for entry in recipients:
-        overlay_reader = create_overlay_pdf(
-            name=entry["name"],
-            competition_name=competition_name,
-            event_id=event_id,
-            certificate_rank=entry["certificate_rank"],
-            result=entry["result"]
+        overlay_reader = render_urkunde_overlay(
+            design,
+            {
+                "name": entry["name"],
+                "rank": entry["certificate_rank"],
+                "event": wca_common.get_event_name(event_id),
+                "event_id": event_id,
+                "competition": competition_name,
+                "result": entry["result"]
+            }
         )
 
-        if USE_TEMPLATE_PDF:
-            template_reader = PdfReader(TEMPLATE_PDF_PATH)
-            page = template_reader.pages[0]
-            page.merge_page(overlay_reader.pages[0])
-            writer.add_page(page)
-        else:
-            writer.add_page(overlay_reader.pages[0])
+        writer.add_page(overlay_reader.pages[0])
 
         print(
             f"✓ {entry['name']} | "

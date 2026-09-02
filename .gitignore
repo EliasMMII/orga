@@ -14,6 +14,9 @@ ENV/
 *.pdf
 ranking_*.txt
 
+# Pro Competition gespeicherte Design-Entwürfe (Hintergründe, Logos, Layouts) ignorieren
+designs/
+
 # VS Code spezifische Ordner ignorieren
 .vscode/
 

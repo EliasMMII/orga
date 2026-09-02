@@ -6,7 +6,10 @@ import requests
 import streamlit as st
 
 import namenschild_live
+import namenschild_round1
 import urkunde_generator
+import wca_common
+import design_studio
 
 
 st.set_page_config(
@@ -16,47 +19,19 @@ st.set_page_config(
 )
 
 
-WCA_API = "https://worldcubeassociation.org/api/v0"
-
-
-EVENT_NAMES = {
-    "333": "3x3",
-    "222": "2x2",
-    "444": "4x4",
-    "555": "5x5",
-    "666": "6x6",
-    "777": "7x7",
-    "333bf": "3x3 Blind",
-    "333fm": "Fewest Moves",
-    "333oh": "3x3 One-Handed",
-    "clock": "Clock",
-    "minx": "Megaminx",
-    "pyram": "Pyraminx",
-    "skewb": "Skewb",
-    "sq1": "Square-1",
-    "444bf": "4x4 Blind",
-    "555bf": "5x5 Blind",
-    "333mbf": "3x3 Multi-Blind"
-}
+EVENT_NAMES = wca_common.EVENT_NAMES
 
 
 def get_wcif(competition_id):
-    url = (
-        f"{WCA_API}/competitions/"
-        f"{competition_id}/wcif/public"
-    )
+    return wca_common.fetch_wcif(competition_id)
 
-    response = requests.get(
-        url,
-        headers={
-            "User-Agent": "WCA Generator"
-        },
-        timeout=20
-    )
 
-    response.raise_for_status()
-
-    return response.json()
+@st.cache_data(ttl=300)
+def get_ongoing_competitions():
+    try:
+        return wca_common.fetch_ongoing_competitions()
+    except Exception:
+        return []
 
 
 def get_available_events(wcif):
@@ -175,31 +150,43 @@ def generate_namenschilder(
     if os.path.exists(output_path):
         os.remove(output_path)
 
-    original_argv = sys.argv.copy()
-
-    try:
-        sys.argv = [
-            "namenschild_live.py",
-            competition_id,
-            event_id,
-            str(round_number),
-            str(count)
-        ]
-
-        namenschild_live.generate_live_badges(
-            competition_id,
-            event_id,
-            round_number,
-            count
-        )
-
-    finally:
-        sys.argv = original_argv
+    namenschild_live.generate_live_badges(
+        competition_id,
+        event_id,
+        round_number,
+        count
+    )
 
     if os.path.exists(output_path):
         return output_path
 
     return None
+
+
+def generate_namenschilder_round1(
+    competition_id,
+    event_id,
+    wcif
+):
+    output_filename = (
+        f"Namensschilder_Round1_"
+        f"{competition_id}_"
+        f"{event_id}.pdf"
+    )
+
+    output_path = os.path.join(
+        os.getcwd(),
+        output_filename
+    )
+
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    return namenschild_round1.generate_round1_badges(
+        wcif,
+        event_id,
+        output_pdf=output_path
+    )
 
 
 def generate_urkunden(
@@ -331,9 +318,88 @@ st.write(
 # COMPETITION LADEN
 # ============================================================
 
+def load_competition(entered_id):
+
+    if not entered_id:
+
+        st.warning(
+            "Bitte eine Competition-ID eingeben."
+        )
+
+        return
+
+    try:
+
+        with st.spinner(
+            "Lade Competition..."
+        ):
+
+            loaded_wcif = get_wcif(
+                entered_id
+            )
+
+        st.session_state.competition_id = (
+            entered_id
+        )
+
+        st.session_state.wcif = (
+            loaded_wcif
+        )
+
+        st.session_state.competition_loaded = True
+
+        st.session_state.generated_files = []
+
+        st.rerun()
+
+    except requests.HTTPError:
+
+        st.error(
+            "Die Competition-ID wurde nicht gefunden "
+            "oder die WCA-Daten konnten nicht geladen werden."
+        )
+
+    except Exception as e:
+
+        st.error(
+            f"Fehler beim Laden der Competition: {e}"
+        )
+
+
 if not st.session_state.competition_loaded:
 
     st.header("1. Competition laden")
+
+    ongoing_competitions = get_ongoing_competitions()
+
+    if ongoing_competitions:
+
+        st.subheader("Aktuell laufende Competitions")
+
+        for competition in ongoing_competitions:
+
+            label = (
+                f"{competition['name']} "
+                f"({competition.get('country_iso2', '?')}, "
+                f"{competition.get('date_range', '')})"
+            )
+
+            if st.button(
+                label,
+                use_container_width=True,
+                key=f"ongoing_{competition['id']}"
+            ):
+
+                load_competition(competition["id"])
+
+        st.divider()
+        st.subheader("Oder Competition-ID manuell eingeben")
+
+    else:
+
+        st.info(
+            "Aktuell laufen laut WCA keine Competitions."
+        )
 
     competition_id_input = st.text_input(
         "WCA Competition-ID",
@@ -347,52 +413,7 @@ if not st.session_state.competition_loaded:
         key="load_competition_button"
     ):
 
-        entered_id = competition_id_input.strip()
-
-        if not entered_id:
-
-            st.warning(
-                "Bitte eine Competition-ID eingeben."
-            )
-
-        else:
-
-            try:
-
-                with st.spinner(
-                    "Lade Competition..."
-                ):
-
-                    loaded_wcif = get_wcif(
-                        entered_id
-                    )
-
-                st.session_state.competition_id = (
-                    entered_id
-                )
-
-                st.session_state.wcif = (
-                    loaded_wcif
-                )
-
-                st.session_state.competition_loaded = True
-
-                st.session_state.generated_files = []
-
-                st.rerun()
-
-            except requests.HTTPError:
-
-                st.error(
-                    "Die Competition-ID wurde nicht gefunden "
-                    "oder die WCA-Daten konnten nicht geladen werden."
-                )
-
-            except Exception as e:
-
-                st.error(
-                    f"Fehler beim Laden der Competition: {e}"
-                )
+        load_competition(competition_id_input.strip())
 
     st.info(
         "Gib die Competition-ID aus der WCA ein, "
@@ -472,8 +493,11 @@ st.header("2. Ausgabe auswählen")
 generator_type = st.radio(
     "Was möchtest du erstellen?",
     [
-        "Namensschilder",
-        "Urkunden"
+        "Namensschilder (Live-Ergebnisse)",
+        "Namensschilder (Runde 1 / Seeding)",
+        "Urkunden",
+        "🎨 Design: Urkunden",
+        "🎨 Design: Namensschilder"
     ],
     horizontal=True,
     key="generator_type"
@@ -484,12 +508,12 @@ st.divider()
 
 
 # ============================================================
-# NAMENSSCHILDER
+# NAMENSSCHILDER (LIVE-ERGEBNISSE)
 # ============================================================
 
-if generator_type == "Namensschilder":
+if generator_type == "Namensschilder (Live-Ergebnisse)":
 
-    st.header("🏷️ Namensschilder")
+    st.header("🏷️ Namensschilder (Live-Ergebnisse)")
 
     event_labels = []
 
@@ -657,10 +681,99 @@ if generator_type == "Namensschilder":
 
 
 # ============================================================
+# NAMENSSCHILDER (RUNDE 1 / SEEDING)
+# ============================================================
+
+elif generator_type == "Namensschilder (Runde 1 / Seeding)":
+
+    st.header("🏷️ Namensschilder (Runde 1 / Seeding)")
+
+    st.write(
+        "Erstellt Namensschilder für alle angemeldeten Teilnehmer eines "
+        "Events, sortiert nach ihrem WCA-Seeding (Personal Best) – "
+        "geeignet, bevor die erste Runde Ergebnisse hat."
+    )
+
+    event_labels_round1 = []
+
+    for event_id in available_events:
+
+        event_name = EVENT_NAMES.get(
+            event_id,
+            event_id.upper()
+        )
+
+        event_labels_round1.append(
+            f"{event_name} ({event_id})"
+        )
+
+    selected_event_label_round1 = st.selectbox(
+        "Event",
+        event_labels_round1,
+        key="badge_round1_event_select"
+    )
+
+    event_id = (
+        selected_event_label_round1
+        .split("(")[-1]
+        .rstrip(")")
+    )
+
+    st.divider()
+
+    if st.button(
+        "🏷️ Namensschilder erstellen",
+        type="primary",
+        use_container_width=True,
+        key="generate_badges_round1_button"
+    ):
+
+        with st.spinner(
+            "Namensschilder werden erstellt..."
+        ):
+
+            try:
+
+                output_path = generate_namenschilder_round1(
+                    competition_id,
+                    event_id,
+                    wcif
+                )
+
+            except Exception as e:
+
+                st.error(
+                    f"Fehler beim Erstellen: {e}"
+                )
+
+                output_path = None
+
+
+        if (
+            output_path
+            and os.path.exists(output_path)
+        ):
+
+            add_generated_file(
+                output_path
+            )
+
+            st.success(
+                "Namensschilder wurden erstellt."
+            )
+
+        else:
+
+            st.error(
+                "Die PDF-Datei konnte nicht gefunden werden."
+            )
+
+
+# ============================================================
 # URKUNDEN
 # ============================================================
 
-else:
+elif generator_type == "Urkunden":
 
     st.header("🏆 Urkunden")
 
@@ -872,6 +985,19 @@ else:
             progress.progress(
                 (index + 1) / total_events
             )
+
+
+# ============================================================
+# DESIGN-STUDIO
+# ============================================================
+
+elif generator_type == "🎨 Design: Urkunden":
+
+    design_studio.render_urkunde_design_studio(competition_id)
+
+elif generator_type == "🎨 Design: Namensschilder":
+
+    design_studio.render_namensschild_design_studio(competition_id)
 
 
 # ============================================================
