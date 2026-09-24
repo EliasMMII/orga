@@ -15,9 +15,11 @@ PORTRAIT_HEIGHT = 842.25
 
 # Jede Schrift, die im Canvas-Editor und im PDF zur Verfügung steht.
 # cssFamily/weight/style steuern die Browser-Vorschau, der Dict-Key selbst
-# ist immer der reportlab-Fontname für den PDF-Export.
+# ist immer der reportlab-Fontname für den PDF-Export. Einträge mit "file"
+# sind eigene TTF-Schriften aus dem fonts-Ordner.
 FONT_DEFINITIONS = {
-    "GreatVibes": {"label": "GreatVibes (Handschrift)", "cssFamily": "GreatVibesWeb", "embed": True},
+    "GreatVibes": {"label": "GreatVibes (Handschrift)", "cssFamily": "GreatVibesWeb", "file": "GreatVibes-Regular.ttf"},
+    "RobotoCondensed": {"label": "Roboto Condensed", "cssFamily": "RobotoCondensedWeb", "file": "RobotoCondensed-VariableFont_wght.ttf"},
     "Times-Roman": {"label": "Times Roman", "cssFamily": "Times New Roman", "weight": "normal", "style": "normal"},
     "Times-Bold": {"label": "Times Bold", "cssFamily": "Times New Roman", "weight": "bold", "style": "normal"},
     "Times-Italic": {"label": "Times Italic", "cssFamily": "Times New Roman", "weight": "normal", "style": "italic"},
@@ -30,19 +32,27 @@ FONT_DEFINITIONS = {
 
 FONT_CHOICES = list(FONT_DEFINITIONS.keys())
 
-GREATVIBES_FONT_PATH = os.path.join("fonts", "GreatVibes-Regular.ttf")
+FONTS_DIR = "fonts"
+
+
+def font_file_path(font_id):
+    """Pfad zur TTF-Datei einer eigenen Schrift, oder None für eingebaute Schriften."""
+    file_name = FONT_DEFINITIONS.get(font_id, {}).get("file")
+    return os.path.join(FONTS_DIR, file_name) if file_name else None
 
 
 def build_font_faces():
     """Baut die Font-Definitionen für den Canvas-Editor, inkl. eingebetteter
-    Web-Font-Daten (z. B. GreatVibes) als data:-URL."""
+    Web-Font-Daten (z. B. GreatVibes, Roboto) als data:-URL."""
     faces = {}
 
     for font_id, info in FONT_DEFINITIONS.items():
         face = dict(info)
+        face.pop("file", None)
+        path = font_file_path(font_id)
 
-        if info.get("embed") and os.path.exists(GREATVIBES_FONT_PATH):
-            with open(GREATVIBES_FONT_PATH, "rb") as f:
+        if path and os.path.exists(path):
+            with open(path, "rb") as f:
                 encoded = base64.b64encode(f.read()).decode("ascii")
             face["dataUrl"] = f"data:font/ttf;base64,{encoded}"
 

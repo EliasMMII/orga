@@ -19,13 +19,16 @@ import design_store
 
 SVG_DIR = os.path.join("assets", "svgs")
 OUTPUT_DIR = "Urkunden_Gesamt"
-FONT_PATH = os.path.join("fonts", "GreatVibes-Regular.ttf")
 
 
-if os.path.exists(FONT_PATH):
-    pdfmetrics.registerFont(TTFont("GreatVibes", FONT_PATH))
-else:
-    print(f"WARNUNG: Schriftart '{FONT_PATH}' nicht gefunden.")
+for _font_id in design_store.FONT_DEFINITIONS:
+    _font_path = design_store.font_file_path(_font_id)
+    if not _font_path:
+        continue
+    if os.path.exists(_font_path):
+        pdfmetrics.registerFont(TTFont(_font_id, _font_path))
+    else:
+        print(f"WARNUNG: Schriftart '{_font_path}' nicht gefunden.")
 
 
 def clean_name(name):
@@ -268,7 +271,7 @@ def draw_event_logo(c, event_id, center_x, center_y, size=30, color=None):
 
 def _safe_set_font(c, font_name, font_size):
     """Setzt die Schriftart, fällt bei nicht registrierten Schriften (z. B.
-    fehlende GreatVibes-Datei) auf Times-Roman zurück."""
+    fehlende TTF-Datei) auf Times-Roman zurück."""
     try:
         c.setFont(font_name, font_size)
         return font_name
