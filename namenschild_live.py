@@ -37,7 +37,16 @@ def generate_live_badges(competition_id, event_id, target_round, count_limit):
         print(f"Fehler: Runde '{round_id_str}' wurde im WCIF nicht gefunden.")
         return
 
-    round_results = selected_round.get("results", [])
+    # Ist die gewählte Runde ein Dual-Round-Finale, zählt das bessere Ergebnis aus beiden Runden.
+    if selected_round is target_event_data["rounds"][-1]:
+        round_results = wca_common.get_final_results(target_event_data)
+    else:
+        round_results = selected_round.get("results", [])
+
+    round_results = sorted(
+        (r for r in round_results if r.get("ranking")),
+        key=lambda r: r["ranking"]
+    )
     if not round_results:
         print(f"Fehler: Runde '{round_id_str}' enthaelt noch keine Ergebnisse.")
         return

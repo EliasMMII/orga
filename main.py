@@ -306,7 +306,7 @@ if "generated_files" not in st.session_state:
 # TITEL
 # ============================================================
 
-st.title("🏆 WCA Generator")
+st.title("GCA Generator")
 
 st.write(
     "Erstelle Namensschilder und Urkunden "
@@ -403,7 +403,7 @@ if not st.session_state.competition_loaded:
 
     competition_id_input = st.text_input(
         "WCA Competition-ID",
-        placeholder="z. B. CapelleChaosB2026"
+        placeholder="z. B. RubiksGermanNationals2026"
     )
 
     if st.button(
@@ -414,11 +414,6 @@ if not st.session_state.competition_loaded:
     ):
 
         load_competition(competition_id_input.strip())
-
-    st.info(
-        "Gib die Competition-ID aus der WCA ein, "
-        "z. B. **CapelleChaosB2026**."
-    )
 
     st.stop()
 

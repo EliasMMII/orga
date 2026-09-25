@@ -80,43 +80,60 @@ def get_competition_data(competition_id, event_id):
         return None, None
 
     final_round = rounds[-1]
-    results = final_round.get("results", [])
+    final_round_ids = wca_common.get_final_linked_round_ids(event_data)
+    is_dual_final = len(final_round_ids) > 1
+
+    if is_dual_final:
+        print(f"Dual-Round-Finale ({', '.join(final_round_ids)}): Es zählt das bessere Ergebnis aus beiden Runden.")
+
+    results = wca_common.get_final_results(event_data)
 
     try:
         live_data = wca_common.fetch_live_round_results(
             competition_id,
             wcif_data.get("name", competition_id),
-            event_id
+            event_id,
+            round_numbers=[wca_common.round_number(rid) for rid in final_round_ids] if is_dual_final else None
         )
     except Exception as e:
         live_data = None
         print(f"Hinweis: WCA Live nicht erreichbar ({e}), nutze WCA-Ergebnisse.")
 
     if live_data:
-        live_results, round_finished = live_data
+        live_results_per_round, round_finished = live_data
 
-        if live_results:
+        if any(live_results_per_round):
             print("Nutze Live-Ergebnisse von WCA Live (aktueller als die WCA-Synchronisierung).")
 
-            results = []
+            results_per_round = []
 
-            for live_result in live_results:
-                person = live_result.get("person") or {}
-                person_id = person.get("registrantId")
+            for live_results in live_results_per_round:
+                round_results = []
 
-                results.append({
-                    "ranking": live_result.get("ranking"),
-                    "personId": person_id,
-                    "best": live_result.get("best"),
-                    "average": live_result.get("average")
-                })
+                for live_result in live_results:
+                    person = live_result.get("person") or {}
+                    person_id = person.get("registrantId")
 
-                if person_id is not None:
-                    persons[person_id] = {
-                        "name": clean_name(person.get("name", "Unbekannt")),
-                        "country": (person.get("country") or {}).get("iso2"),
-                        "wca_id": person.get("wcaId")
-                    }
+                    round_results.append({
+                        "ranking": live_result.get("ranking"),
+                        "personId": person_id,
+                        "best": live_result.get("best"),
+                        "average": live_result.get("average")
+                    })
+
+                    if person_id is not None:
+                        persons[person_id] = {
+                            "name": clean_name(person.get("name", "Unbekannt")),
+                            "country": (person.get("country") or {}).get("iso2"),
+                            "wca_id": person.get("wcaId")
+                        }
+
+                results_per_round.append(round_results)
+
+            if is_dual_final:
+                results = wca_common.combine_linked_round_results(results_per_round, final_round.get("format"))
+            else:
+                results = results_per_round[0]
 
             if not round_finished:
                 print("WARNUNG: Die Runde ist laut WCA Live noch nicht als abgeschlossen markiert.")

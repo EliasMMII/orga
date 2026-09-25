@@ -91,14 +91,141 @@ def format_wca_time(centiseconds, event_id, mbf_order="badge"):
 
 
 def fetch_wcif(competition_id, timeout=20):
-    """Lädt die öffentlichen WCIF-Daten einer Competition von der WCA-API."""
-    url = f"{WCA_API_BASE}/competitions/{competition_id}/wcif/public"
-    headers = {"User-Agent": "Mozilla/5.0 WCA Generator"}
+    """Lädt die öffentlichen WCIF-Daten einer Competition von der WCA-API.
 
-    response = requests.get(url, headers=headers, timeout=timeout)
+    Bevorzugt wird WCIF Version 2, da nur diese bei Runden das Feld
+    'linkedRounds' (Dual Rounds) enthält. Ist sie nicht verfügbar, wird auf
+    das bisherige öffentliche WCIF zurückgefallen.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 WCA Generator"}
+    base_url = f"{WCA_API_BASE}/competitions/{competition_id}/wcif"
+
+    try:
+        response = requests.get(f"{base_url}/version/2", headers=headers, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException:
+        pass
+
+    response = requests.get(f"{base_url}/public", headers=headers, timeout=timeout)
     response.raise_for_status()
 
     return response.json()
+
+
+def round_number(round_id):
+    """'333-r2' -> 2"""
+    try:
+        return int(str(round_id).split("-r")[-1])
+    except ValueError:
+        return None
+
+
+def get_final_linked_round_ids(event_data):
+    """Gibt die Runden-IDs zurück, deren Ergebnisse für die Endplatzierung zählen.
+
+    Normalerweise ist das nur die letzte Runde. Ist die letzte Runde Teil
+    einer Dual Round (WCIF 'linkedRounds'), zählen alle verbundenen Runden.
+    """
+    rounds = event_data.get("rounds", [])
+
+    if not rounds:
+        return []
+
+    final_round = rounds[-1]
+    linked = final_round.get("linkedRounds") or []
+
+    if final_round.get("id") in linked and len(linked) > 1:
+        return list(linked)
+
+    return [final_round.get("id")]
+
+
+def _comparable(value):
+    # 0 = kein Ergebnis, -1 = DNF, -2 = DNS -> schlechter als jedes echte Ergebnis
+    return value if value and value > 0 else float("inf")
+
+
+def _result_sort_key(result, round_format):
+    best = _comparable(result.get("best"))
+    average = _comparable(result.get("average"))
+
+    # Siehe WCA formats.json: Ao5 und Mo3 werden nach Average sortiert,
+    # alle "Best of X"-Formate nach Single.
+    if round_format in ("a", "m"):
+        return (average, best)
+
+    return (best, average)
+
+
+def combine_linked_round_results(results_per_round, round_format):
+    """Kombiniert die Ergebnisse mehrerer verbundener Runden (Dual Rounds,
+    Regulation 9v4): Pro Person zählt das bessere Ergebnis aus allen Runden,
+    daraus wird die Platzierung neu berechnet (gleiche Ergebnisse = gleicher Rang).
+
+    Erwartet Ergebnislisten mit personId, best und average und gibt eine Liste
+    im selben Format mit neu berechnetem 'ranking' zurück.
+    """
+    best_per_person = {}
+
+    for results in results_per_round:
+        for result in results:
+            person_id = result.get("personId")
+
+            if person_id is None:
+                continue
+
+            current = best_per_person.get(person_id)
+
+            if current is None or _result_sort_key(result, round_format) < _result_sort_key(current, round_format):
+                best_per_person[person_id] = result
+
+    combined = sorted(
+        best_per_person.values(),
+        key=lambda r: _result_sort_key(r, round_format)
+    )
+
+    ranked = []
+    previous_key = None
+    previous_rank = None
+
+    for index, result in enumerate(combined, start=1):
+        key = _result_sort_key(result, round_format)
+
+        if not result.get("best") and not result.get("average"):
+            # Noch kein Ergebnis eingetragen (nur DNF/DNS wird wie bei der WCA gemeinsam Letzter)
+            rank = None
+        elif key == previous_key:
+            rank = previous_rank
+        else:
+            rank = index
+
+        previous_key, previous_rank = key, rank
+
+        entry = dict(result)
+        entry["ranking"] = rank
+        ranked.append(entry)
+
+    return ranked
+
+
+def get_final_results(event_data):
+    """Ergebnisse der Finalrunde eines Events - bei einem Dual-Round-Finale
+    bereits aus beiden Runden kombiniert (siehe combine_linked_round_results)."""
+    rounds = event_data.get("rounds", [])
+
+    if not rounds:
+        return []
+
+    round_ids = get_final_linked_round_ids(event_data)
+
+    if len(round_ids) == 1:
+        return rounds[-1].get("results", [])
+
+    rounds_by_id = {r.get("id"): r for r in rounds}
+    results_per_round = [rounds_by_id.get(rid, {}).get("results", []) for rid in round_ids]
+
+    return combine_linked_round_results(results_per_round, rounds[-1].get("format"))
 
 
 def fetch_ongoing_competitions(lookback_days=10, timeout=15):
@@ -198,13 +325,18 @@ def _find_wca_live_competition_id(competition_id, name_hint):
     return None
 
 
-def fetch_live_round_results(competition_id, competition_name, event_id):
-    """Lädt die Ergebnisse der letzten (finalen) Runde eines Events direkt aus
-    WCA Live, ohne die Synchronisationsverzögerung zur öffentlichen WCA-API.
+def fetch_live_round_results(competition_id, competition_name, event_id, round_numbers=None):
+    """Lädt die Ergebnisse von Runden eines Events direkt aus WCA Live, ohne
+    die Synchronisationsverzögerung zur öffentlichen WCA-API.
 
-    Gibt (results, finished) zurück - results im WCA-Live-Format (ranking,
-    best, average, person{...}) - oder None, wenn die Competition oder das
-    Event auf WCA Live nicht gefunden werden konnte.
+    round_numbers gibt die gewünschten Runden an (z. B. [1, 2] für ein
+    Dual-Round-Finale), Standard ist nur die letzte (finale) Runde.
+
+    Gibt (results_per_round, finished) zurück - eine Ergebnisliste pro Runde
+    im WCA-Live-Format (ranking, best, average, person{...}), finished ist nur
+    True, wenn alle Runden abgeschlossen sind - oder None, wenn die
+    Competition, das Event oder eine der Runden auf WCA Live nicht gefunden
+    werden konnte.
     """
     live_competition_id = _find_wca_live_competition_id(competition_id, competition_name)
 
@@ -238,7 +370,14 @@ def fetch_live_round_results(competition_id, competition_name, event_id):
     if not target_rounds:
         return None
 
-    final_round = max(target_rounds, key=lambda r: r.get("number", 0))
+    if round_numbers:
+        rounds_by_number = {r.get("number"): r for r in target_rounds}
+        selected_rounds = [rounds_by_number.get(n) for n in round_numbers]
+
+        if None in selected_rounds:
+            return None
+    else:
+        selected_rounds = [max(target_rounds, key=lambda r: r.get("number", 0))]
 
     round_query = """
         query($id: ID!) {
@@ -259,13 +398,20 @@ def fetch_live_round_results(competition_id, competition_name, event_id):
         }
     """
 
-    round_data = _wca_live_request(round_query, {"id": final_round["id"]})
-    round_info = round_data.get("round")
+    results_per_round = []
+    all_finished = True
 
-    if not round_info:
-        return None
+    for selected_round in selected_rounds:
+        round_data = _wca_live_request(round_query, {"id": selected_round["id"]})
+        round_info = round_data.get("round")
 
-    return round_info.get("results", []), round_info.get("finished", False)
+        if not round_info:
+            return None
+
+        results_per_round.append(round_info.get("results", []))
+        all_finished = all_finished and round_info.get("finished", False)
+
+    return results_per_round, all_finished
 
 
 def draw_competition_logo(c, logo_path=None, scale=1.0):
