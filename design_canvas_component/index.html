@@ -71,7 +71,6 @@
     <div id="props-text" class="group hidden">
       <label>Schriftart <select id="p-font"></select></label>
       <label>Größe <input type="number" id="p-size" min="6" max="200"></label>
-      <label>Farbe <input type="color" id="p-color"></label>
       <label>Ausrichtung
         <select id="p-align">
           <option value="left">Links</option>
@@ -80,9 +79,27 @@
         </select>
       </label>
     </div>
-    <div id="props-logo" class="group hidden">
-      <label>Logo-Farbe <input type="color" id="p-logo-color"></label>
-      <button id="btn-logo-color-reset" title="Original-SVG-Farben verwenden">Originalfarben</button>
+    <div id="props-fill" class="group hidden">
+      <label>Füllung
+        <select id="p-fill-mode">
+          <option value="original">Originalfarben</option>
+          <option value="solid">Einfarbig</option>
+          <option value="gradient">Farbverlauf</option>
+        </select>
+      </label>
+      <label id="p-color-label">Farbe <input type="color" id="p-color" value="#000000"></label>
+      <label id="p-grad-from-label">Verlauf von <input type="color" id="p-grad-from" value="#1a5276"></label>
+      <label id="p-grad-to-label">nach <input type="color" id="p-grad-to" value="#d35400"></label>
+      <label id="p-grad-angle-label">Richtung
+        <select id="p-grad-angle">
+          <option value="0">→ links nach rechts</option>
+          <option value="180">← rechts nach links</option>
+          <option value="90">↓ oben nach unten</option>
+          <option value="270">↑ unten nach oben</option>
+          <option value="45">↘ diagonal nach unten</option>
+          <option value="315">↗ diagonal nach oben</option>
+        </select>
+      </label>
     </div>
   </div>
 
@@ -132,6 +149,9 @@ var fontFaceMap = {};
 var syncTimer = null;
 var idCounter = 0;
 var guideLines = [];
+var eventLogoSvg = null;
+var buildCounter = 0;
+var loadingInitial = false;
 
 var MAX_DISPLAY_WIDTH = 650;
 var MAX_DISPLAY_HEIGHT = 700;
@@ -231,14 +251,38 @@ function buildCanvas(args) {
     }, { crossOrigin: "anonymous" });
   }
 
-  (args.initialLayers || []).forEach(function (layer) {
-    addLayerToCanvas(layer, true);
-  });
+  // Layer nacheinander laden (SVGs/Bilder laden asynchron), damit die
+  // Reihenfolge (vorne/hinten) erhalten bleibt. Erst danach wird synchronisiert.
+  eventLogoSvg = args.eventLogoSvg || null;
+  var token = ++buildCounter;
+  var initialLayers = (args.initialLayers || []).slice();
+  loadingInitial = true;
 
-  canvas.on("object:modified", scheduleSync);
+  (function addNext(i) {
+    if (token !== buildCounter) return;
+    if (i >= initialLayers.length) {
+      loadingInitial = false;
+      canvas.requestRenderAll();
+      scheduleSync();
+      return;
+    }
+    createLayerObject(initialLayers[i], function (obj) {
+      if (token !== buildCounter) return;
+      if (obj) canvas.add(obj);
+      addNext(i + 1);
+    });
+  })(0);
+
+  canvas.on("object:modified", function (e) {
+    if (e.target && e.target.__layerType === "text") applyTextFill(e.target);
+    scheduleSync();
+  });
   canvas.on("object:added", scheduleSync);
   canvas.on("object:removed", scheduleSync);
-  canvas.on("text:changed", scheduleSync);
+  canvas.on("text:changed", function (e) {
+    if (e.target) applyTextFill(e.target);
+    scheduleSync();
+  });
   canvas.on("object:moving", function (e) {
     snapObjectPosition(e.target);
     updatePropsBar();
@@ -253,10 +297,214 @@ function buildCanvas(args) {
 
   canvas.requestRenderAll();
   onSelectionChanged();
-  Streamlit.setFrameHeight(displayHeight + 200);
+  Streamlit.setFrameHeight(displayHeight + 270);
 }
 
-function addLayerToCanvas(layer, fromInitial) {
+// --- Füllung: einfarbig / Farbverlauf ---
+
+function normalizeGradient(g) {
+  if (!g || !g.from || !g.to) return null;
+  return { from: g.from, to: g.to, angle: parseFloat(g.angle) || 0 };
+}
+
+// Start-/Endpunkt eines linearen Verlaufs über eine Box (w x h), deren linke
+// obere Ecke bei (offX, offY) liegt. 0° = links nach rechts, 90° = oben nach
+// unten - identisch zu gradient_axis() im PDF-Export.
+function gradientCoords(w, h, angle, offX, offY) {
+  var rad = (angle || 0) * Math.PI / 180;
+  var dx = Math.cos(rad), dy = Math.sin(rad);
+  var half = (Math.abs(w * dx) + Math.abs(h * dy)) / 2;
+  var cx = (offX || 0) + w / 2, cy = (offY || 0) + h / 2;
+  return { x1: cx - dx * half, y1: cy - dy * half, x2: cx + dx * half, y2: cy + dy * half };
+}
+
+function makeGradient(g, coords) {
+  return new fabric.Gradient({
+    type: "linear",
+    gradientUnits: "pixels",
+    coords: coords,
+    colorStops: [{ offset: 0, color: g.from }, { offset: 1, color: g.to }]
+  });
+}
+
+function tintOf(obj) {
+  if (obj.__gradient) return { gradient: obj.__gradient };
+  if (obj.__color) return { color: obj.__color };
+  return null;
+}
+
+function fillForTint(tint, w, h) {
+  if (tint.gradient) return makeGradient(tint.gradient, gradientCoords(w, h, tint.gradient.angle, 0, 0));
+  return tint.color;
+}
+
+function applyTextFill(obj) {
+  var g = obj.__gradient;
+  if (!g) {
+    obj.set("fill", obj.__color || "#000000");
+    return;
+  }
+  // Verlauf über die tatsächliche Textbreite (nicht die ganze Textbox) -
+  // wie im PDF-Export.
+  var textWidth = 0;
+  for (var i = 0; i < obj._textLines.length; i++) {
+    textWidth = Math.max(textWidth, obj.getLineWidth(i));
+  }
+  var offset = 0;
+  if (obj.textAlign === "center") offset = (obj.width - textWidth) / 2;
+  else if (obj.textAlign === "right") offset = obj.width - textWidth;
+  var coords = gradientCoords(textWidth, obj.height, g.angle, offset, 0);
+  obj.set("fill", makeGradient(g, coords));
+  obj.dirty = true;
+}
+
+// --- SVG-Elemente (Event-Logo, hochgeladene SVGs) ---
+
+function isSvgDataUrl(src) {
+  return typeof src === "string" && src.indexOf("data:image/svg") === 0;
+}
+
+function svgTextFromDataUrl(src) {
+  var comma = src.indexOf(",");
+  var header = src.slice(0, comma), body = src.slice(comma + 1);
+  if (/;base64/i.test(header)) {
+    var binary = atob(body);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+  return decodeURIComponent(body);
+}
+
+// Baut aus SVG-Quelltext ein Canvas-Objekt in der Größe der SVG-Seite.
+// Ohne tint: die Original-Grafik. Mit tint ({color} oder {gradient}): eine
+// Fläche in der Farbe/dem Verlauf, die auf die Form der Grafik zugeschnitten
+// ist - so läuft ein Verlauf durchgehend über das ganze Logo.
+function buildSvgObject(svgText, tint, done) {
+  try {
+    fabric.loadSVGFromString(svgText, function (objects, options) {
+      objects = (objects || []).filter(function (o) { return !!o; });
+      if (!objects.length) { done(null); return; }
+
+      var vw = options && options.width, vh = options && options.height;
+      var art;
+      if (vw && vh) {
+        art = new fabric.Group(objects, { width: vw, height: vh, centerPoint: { x: vw / 2, y: vh / 2 } });
+      } else {
+        art = new fabric.Group(objects);
+        vw = art.width;
+        vh = art.height;
+      }
+
+      var obj;
+      if (tint) {
+        art.set({ originX: "center", originY: "center", left: 0, top: 0 });
+        obj = new fabric.Rect({
+          width: vw, height: vh, strokeWidth: 0,
+          fill: fillForTint(tint, vw, vh), clipPath: art
+        });
+      } else {
+        art.set({ originX: "left", originY: "top", left: 0, top: 0 });
+        obj = art;
+      }
+      obj.__tinted = !!tint;
+      obj.__svgText = svgText;
+      obj.set({ cornerStyle: "circle", transparentCorners: false });
+      // Nur proportional skalierbar - das PDF zeichnet Logos nie verzerrt.
+      obj.setControlsVisibility({ ml: false, mr: false, mt: false, mb: false });
+      done(obj);
+    });
+  } catch (err) {
+    done(null);
+  }
+}
+
+var SVG_META_KEYS = ["__id", "__layerType", "__src", "__isSvg", "__svgText", "__color", "__gradient"];
+
+// Tauscht ein SVG-Objekt gegen eine neu aufgebaute Variante (Original <->
+// eingefärbt) an derselben Stelle und in derselben Ebene aus.
+function swapSvgObject(oldObj) {
+  if (oldObj.__swapping) return;
+  oldObj.__swapping = true;
+  var requestedTint = tintOf(oldObj);
+
+  buildSvgObject(oldObj.__svgText, requestedTint, function (newObj) {
+    oldObj.__swapping = false;
+    var index = canvas ? canvas.getObjects().indexOf(oldObj) : -1;
+    if (!newObj || index < 0) return;
+
+    // Während des Ladens kann sich die Auswahl im Farbfeld geändert haben.
+    var latestTint = tintOf(oldObj);
+    if (!!latestTint !== !!requestedTint) { swapSvgObject(oldObj); return; }
+
+    SVG_META_KEYS.forEach(function (key) { newObj[key] = oldObj[key]; });
+    if (latestTint) newObj.set("fill", fillForTint(latestTint, newObj.width, newObj.height));
+    newObj.set({
+      left: oldObj.left, top: oldObj.top, angle: oldObj.angle,
+      scaleX: oldObj.scaleX, scaleY: oldObj.scaleY
+    });
+
+    var wasActive = canvas.getActiveObject() === oldObj;
+    canvas.remove(oldObj);
+    canvas.insertAt(newObj, index);
+    newObj.setCoords();
+    if (wasActive) canvas.setActiveObject(newObj);
+    canvas.requestRenderAll();
+    scheduleSync();
+  });
+}
+
+function placeholderFill(obj) {
+  var color = obj.__gradient ? obj.__gradient.from : obj.__color;
+  return color ? (color + "55") : "rgba(200,200,200,0.35)";
+}
+
+// Ersatzdarstellung, falls kein Beispiel-Event-Logo geladen werden konnte.
+function makeEventLogoPlaceholder(layer) {
+  var width = layer.width || 30;
+  var height = layer.height || 30;
+  var rect = new fabric.Rect({
+    width: width, height: height,
+    fill: "rgba(200,200,200,0.35)", stroke: "#999", strokeDashArray: [4, 4],
+    originX: "left", originY: "top"
+  });
+  var label = new fabric.Text("EVENT-\nLOGO", {
+    fontSize: 9, fill: "#666", textAlign: "center",
+    originX: "center", originY: "center",
+    left: width / 2, top: height / 2
+  });
+  var group = new fabric.Group([rect, label], {
+    left: layer.x || 40,
+    top: layer.y || 40,
+    angle: layer.angle || 0,
+    cornerStyle: "circle",
+    transparentCorners: false
+  });
+  group.__isPlaceholder = true;
+  return group;
+}
+
+function applyFill(obj) {
+  if (obj.__layerType === "text") {
+    applyTextFill(obj);
+  } else if (obj.__isPlaceholder) {
+    var rectChild = obj._objects && obj._objects[0];
+    if (rectChild) rectChild.set({ fill: placeholderFill(obj) });
+    obj.dirty = true;
+  } else {
+    var tint = tintOf(obj);
+    if (obj.__tinted && tint) {
+      obj.set("fill", fillForTint(tint, obj.width, obj.height));
+      obj.dirty = true;
+    } else if (obj.__tinted || tint) {
+      swapSvgObject(obj);
+    }
+  }
+}
+
+// Erzeugt das Canvas-Objekt zu einem Layer und übergibt es an done(obj)
+// (null, wenn der Layer nicht dargestellt werden kann).
+function createLayerObject(layer, done) {
   if (layer.type === "text") {
     var textbox = new fabric.Textbox(layer.content || "Text", {
       left: layer.x || 20,
@@ -275,55 +523,100 @@ function addLayerToCanvas(layer, fromInitial) {
     textbox.__id = layer.id || newId();
     textbox.__fontId = layer.font || Object.keys(fontFaceMap)[0];
     textbox.__layerType = "text";
-    canvas.add(textbox);
+    textbox.__color = layer.color || "#000000";
+    textbox.__gradient = normalizeGradient(layer.gradient);
+    applyTextFill(textbox);
+    done(textbox);
   } else if (layer.type === "image" && layer.src) {
-    fabric.Image.fromURL(layer.src, function (img) {
-      img.set({
-        left: layer.x || 20,
-        top: layer.y || 20,
-        angle: layer.angle || 0,
-        cornerStyle: "circle",
-        transparentCorners: false
+    var loadRaster = function () {
+      fabric.Image.fromURL(layer.src, function (img) {
+        img.set({
+          left: layer.x || 20,
+          top: layer.y || 20,
+          angle: layer.angle || 0,
+          cornerStyle: "circle",
+          transparentCorners: false
+        });
+        if (layer.width) img.scaleToWidth(layer.width);
+        if (layer.height) img.scaleToHeight(layer.height);
+        img.__id = layer.id || newId();
+        img.__layerType = "image";
+        img.__src = layer.src;
+        done(img);
+      }, { crossOrigin: "anonymous" });
+    };
+
+    if (!isSvgDataUrl(layer.src)) { loadRaster(); return; }
+
+    var color = layer.color || null;
+    var gradient = normalizeGradient(layer.gradient);
+    var svgText;
+    try { svgText = svgTextFromDataUrl(layer.src); } catch (err) { loadRaster(); return; }
+
+    buildSvgObject(svgText, gradient ? { gradient: gradient } : (color ? { color: color } : null), function (obj) {
+      if (!obj) { loadRaster(); return; }
+      var scale = 1;
+      if (layer.height) scale = layer.height / obj.height;
+      else if (layer.width) scale = layer.width / obj.width;
+      obj.set({
+        left: layer.x || 20, top: layer.y || 20, angle: layer.angle || 0,
+        scaleX: scale, scaleY: scale
       });
-      if (layer.width) img.scaleToWidth(layer.width);
-      if (layer.height) img.scaleToHeight(layer.height);
-      img.__id = layer.id || newId();
-      img.__layerType = "image";
-      img.__src = layer.src;
-      canvas.add(img);
-      if (!fromInitial) canvas.setActiveObject(img);
-      scheduleSync();
-    }, { crossOrigin: "anonymous" });
+      obj.__id = layer.id || newId();
+      obj.__layerType = "image";
+      obj.__src = layer.src;
+      obj.__isSvg = true;
+      obj.__color = color;
+      obj.__gradient = gradient;
+      done(obj);
+    });
   } else if (layer.type === "event_logo") {
-    var width = layer.width || 30;
-    var height = layer.height || 30;
-    var rectFill = layer.color ? (layer.color + "55") : "rgba(200,200,200,0.35)";
-    var rect = new fabric.Rect({
-      width: width, height: height,
-      fill: rectFill, stroke: "#999", strokeDashArray: [4, 4],
-      originX: "left", originY: "top"
+    var logoColor = layer.color || null;
+    var logoGradient = normalizeGradient(layer.gradient);
+    var finish = function (obj) {
+      obj.__id = layer.id || newId();
+      obj.__layerType = "event_logo";
+      obj.__color = logoColor;
+      obj.__gradient = logoGradient;
+      if (obj.__isPlaceholder) applyFill(obj);
+      done(obj);
+    };
+
+    if (!eventLogoSvg) { finish(makeEventLogoPlaceholder(layer)); return; }
+
+    buildSvgObject(eventLogoSvg, logoGradient ? { gradient: logoGradient } : (logoColor ? { color: logoColor } : null), function (obj) {
+      if (!obj) { finish(makeEventLogoPlaceholder(layer)); return; }
+      // Wie im PDF: Logo proportional in das Quadrat max(Breite, Höhe)
+      // einpassen und in der Box zentrieren.
+      var width = layer.width || 30, height = layer.height || 30;
+      var size = Math.max(width, height);
+      var scale = Math.min(size / obj.width, size / obj.height);
+      obj.set({
+        left: (layer.x === undefined ? 40 : layer.x) + width / 2 - obj.width * scale / 2,
+        top: (layer.y === undefined ? 40 : layer.y) + height / 2 - obj.height * scale / 2,
+        angle: layer.angle || 0,
+        scaleX: scale, scaleY: scale
+      });
+      finish(obj);
     });
-    var label = new fabric.Text("EVENT-\nLOGO", {
-      fontSize: 9, fill: "#666", textAlign: "center",
-      originX: "center", originY: "center",
-      left: width / 2, top: height / 2
-    });
-    var group = new fabric.Group([rect, label], {
-      left: layer.x || 40,
-      top: layer.y || 40,
-      angle: layer.angle || 0,
-      cornerStyle: "circle",
-      transparentCorners: false
-    });
-    group.__id = layer.id || newId();
-    group.__layerType = "event_logo";
-    group.__color = layer.color || null;
-    canvas.add(group);
-    if (!fromInitial) canvas.setActiveObject(group);
+  } else {
+    done(null);
   }
 }
 
+// Fügt ein neues (vom Nutzer angelegtes) Element hinzu und wählt es aus.
+function addLayerToCanvas(layer) {
+  createLayerObject(layer, function (obj) {
+    if (!obj || !canvas) return;
+    canvas.add(obj);
+    canvas.setActiveObject(obj);
+    canvas.requestRenderAll();
+    scheduleSync();
+  });
+}
+
 function scheduleSync() {
+  if (loadingInitial) return;
   if (syncTimer) clearTimeout(syncTimer);
   syncTimer = setTimeout(syncToStreamlit, 250);
 }
@@ -346,18 +639,24 @@ function syncToStreamlit() {
       base.height = obj.height * obj.scaleY;
       base.font = obj.__fontId;
       base.size = obj.fontSize;
-      base.color = obj.fill;
+      base.color = obj.__color || "#000000";
+      base.gradient = obj.__gradient || null;
       base.align = obj.textAlign;
     } else if (obj.__layerType === "image") {
       base.type = "image";
       base.width = obj.getScaledWidth();
       base.height = obj.getScaledHeight();
       base.src = obj.__src;
+      if (obj.__isSvg) {
+        base.color = obj.__color || null;
+        base.gradient = obj.__gradient || null;
+      }
     } else if (obj.__layerType === "event_logo") {
       base.type = "event_logo";
       base.width = obj.getScaledWidth();
       base.height = obj.getScaledHeight();
       base.color = obj.__color || null;
+      base.gradient = obj.__gradient || null;
     }
     return base;
   });
@@ -468,31 +767,107 @@ function updatePropsBar() {
   document.getElementById("p-angle").value = Math.round(obj.angle || 0);
 
   var textGroup = document.getElementById("props-text");
-  var logoGroup = document.getElementById("props-logo");
   var heightLabel = document.getElementById("p-height-label");
 
   if (obj.__layerType === "text") {
     textGroup.classList.remove("hidden");
-    logoGroup.classList.add("hidden");
     heightLabel.classList.add("hidden");
 
     document.getElementById("p-font").value = obj.__fontId;
     document.getElementById("p-size").value = obj.fontSize;
-    document.getElementById("p-color").value = obj.fill;
     document.getElementById("p-align").value = obj.textAlign;
   } else {
     textGroup.classList.add("hidden");
     heightLabel.classList.remove("hidden");
     document.getElementById("p-height").value = Math.round(obj.getScaledHeight());
-
-    if (obj.__layerType === "event_logo") {
-      logoGroup.classList.remove("hidden");
-      document.getElementById("p-logo-color").value = obj.__color || "#000000";
-    } else {
-      logoGroup.classList.add("hidden");
-    }
   }
+
+  updateFillControls(obj);
 }
+
+function isFillable(obj) {
+  return !!obj && (
+    obj.__layerType === "text" || obj.__layerType === "event_logo" ||
+    (obj.__layerType === "image" && obj.__isSvg)
+  );
+}
+
+function fillModeOf(obj) {
+  if (obj.__gradient) return "gradient";
+  if (obj.__color || obj.__layerType === "text") return "solid";
+  return "original";
+}
+
+function updateFillControls(obj) {
+  var group = document.getElementById("props-fill");
+
+  if (!isFillable(obj)) {
+    group.classList.add("hidden");
+    return;
+  }
+
+  group.classList.remove("hidden");
+
+  var isText = obj.__layerType === "text";
+  var mode = fillModeOf(obj);
+  var modeSelect = document.getElementById("p-fill-mode");
+  var originalOption = modeSelect.querySelector('option[value="original"]');
+  originalOption.hidden = isText;
+  originalOption.disabled = isText;
+  modeSelect.value = mode;
+
+  if (obj.__color) document.getElementById("p-color").value = obj.__color;
+  if (obj.__gradient) {
+    document.getElementById("p-grad-from").value = obj.__gradient.from;
+    document.getElementById("p-grad-to").value = obj.__gradient.to;
+    document.getElementById("p-grad-angle").value = String(obj.__gradient.angle);
+  }
+
+  document.getElementById("p-color-label").classList.toggle("hidden", mode !== "solid");
+  ["p-grad-from-label", "p-grad-to-label", "p-grad-angle-label"].forEach(function (id) {
+    document.getElementById(id).classList.toggle("hidden", mode !== "gradient");
+  });
+}
+
+function onFillControlsChanged(e) {
+  var obj = canvas.getActiveObject();
+  if (!isFillable(obj) || canvas.getActiveObjects().length > 1) return;
+
+  var isText = obj.__layerType === "text";
+  var mode = document.getElementById("p-fill-mode").value;
+  var modeSwitched = e && e.target && e.target.id === "p-fill-mode";
+
+  if (mode === "gradient") {
+    // Beim Umschalten auf Verlauf mit der bisherigen Farbe starten.
+    if (modeSwitched && !obj.__gradient && obj.__color) {
+      document.getElementById("p-grad-from").value = obj.__color;
+    }
+    obj.__gradient = {
+      from: document.getElementById("p-grad-from").value,
+      to: document.getElementById("p-grad-to").value,
+      angle: parseFloat(document.getElementById("p-grad-angle").value) || 0
+    };
+    if (!isText) obj.__color = null;
+  } else if (mode === "solid") {
+    if (modeSwitched && !obj.__color && obj.__gradient) {
+      document.getElementById("p-color").value = obj.__gradient.from;
+    }
+    obj.__gradient = null;
+    obj.__color = document.getElementById("p-color").value;
+  } else {
+    obj.__gradient = null;
+    obj.__color = isText ? (obj.__color || "#000000") : null;
+  }
+
+  applyFill(obj);
+  updateFillControls(obj);
+  canvas.requestRenderAll();
+  scheduleSync();
+}
+
+["p-fill-mode", "p-color", "p-grad-from", "p-grad-to", "p-grad-angle"].forEach(function (id) {
+  document.getElementById(id).addEventListener("input", onFillControlsChanged);
+});
 
 function updateAlignButtons() {
   var hasSelection = !!canvas.getActiveObject();
@@ -583,27 +958,6 @@ function applyPositionFields() {
   document.getElementById(id).addEventListener("input", applyPositionFields);
 });
 
-document.getElementById("p-logo-color").addEventListener("input", function () {
-  var obj = canvas.getActiveObject();
-  if (!obj || obj.__layerType !== "event_logo") return;
-  obj.__color = this.value;
-  var rectChild = obj._objects && obj._objects[0];
-  if (rectChild) rectChild.set({ fill: this.value + "55" });
-  canvas.requestRenderAll();
-  scheduleSync();
-});
-
-document.getElementById("btn-logo-color-reset").addEventListener("click", function () {
-  var obj = canvas.getActiveObject();
-  if (!obj || obj.__layerType !== "event_logo") return;
-  obj.__color = null;
-  var rectChild = obj._objects && obj._objects[0];
-  if (rectChild) rectChild.set({ fill: "rgba(200,200,200,0.35)" });
-  document.getElementById("p-logo-color").value = "#000000";
-  canvas.requestRenderAll();
-  scheduleSync();
-});
-
 // --- Toolbar-Aktionen ---
 
 document.getElementById("btn-add-text").addEventListener("click", function () {
@@ -652,7 +1006,7 @@ document.getElementById("btn-back").addEventListener("click", function () {
   if (obj) { canvas.sendToBack(obj); scheduleSync(); }
 });
 
-["p-font", "p-size", "p-color", "p-align"].forEach(function (id) {
+["p-font", "p-size", "p-align"].forEach(function (id) {
   document.getElementById(id).addEventListener("input", function () {
     var obj = canvas.getActiveObject();
     if (!obj || obj.__layerType !== "text") return;
@@ -661,10 +1015,10 @@ document.getElementById("btn-back").addEventListener("click", function () {
       fontWeight: cssFontWeight(document.getElementById("p-font").value),
       fontStyle: cssFontStyle(document.getElementById("p-font").value),
       fontSize: parseInt(document.getElementById("p-size").value, 10) || obj.fontSize,
-      fill: document.getElementById("p-color").value,
       textAlign: document.getElementById("p-align").value
     });
     obj.__fontId = document.getElementById("p-font").value;
+    applyTextFill(obj);
     canvas.requestRenderAll();
     scheduleSync();
   });

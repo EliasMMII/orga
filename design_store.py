@@ -5,6 +5,7 @@ import json
 import os
 import uuid
 import zipfile
+from urllib.parse import unquote_to_bytes
 
 import pymupdf as fitz
 
@@ -95,7 +96,7 @@ def default_urkunde_layers():
         _text_layer("in {event}", 175, 480, 180, 32, "Times-Roman", 22, "#000000", "left"),
         {
             "id": str(uuid.uuid4()), "type": "event_logo",
-            "x": 365, "y": 478, "width": 30, "height": 30, "angle": 0, "color": None
+            "x": 365, "y": 478, "width": 30, "height": 30, "angle": 0, "color": None, "gradient": None
         },
         _text_layer("bei den {competition}", 100, 530, 395, 32, "Times-Roman", 21, "#000000", "center"),
         _text_layer("{result_label}", 100, 575, 395, 28, "Times-Roman", 20, "#000000", "center"),
@@ -158,7 +159,9 @@ def data_url_to_bytes(data_url):
     header, encoded = data_url.split(",", 1)
     ext = ".png"
 
-    if "image/jpeg" in header or "image/jpg" in header:
+    if "image/svg" in header:
+        ext = ".svg"
+    elif "image/jpeg" in header or "image/jpg" in header:
         ext = ".jpg"
     elif "image/png" in header:
         ext = ".png"
@@ -167,19 +170,46 @@ def data_url_to_bytes(data_url):
     elif "image/webp" in header:
         ext = ".webp"
 
-    return base64.b64decode(encoded), ext
+    if ";base64" in header:
+        return base64.b64decode(encoded), ext
+
+    # z. B. "data:image/svg+xml;utf8,<svg ...>" (URL-kodiert statt base64)
+    return unquote_to_bytes(encoded), ext
+
+
+def _image_mime(ext):
+    ext = (ext or "png").lower().lstrip(".") or "png"
+
+    if ext in ("jpg", "jpeg"):
+        return "jpeg"
+
+    if ext == "svg":
+        return "svg+xml"
+
+    return ext
 
 
 def file_to_data_url(path):
     """Liest eine Bilddatei ein und gibt sie als data:-URL zurück (für die
     Anzeige im Canvas-Editor)."""
-    ext = os.path.splitext(path)[1].lower().lstrip(".") or "png"
-    mime = "jpeg" if ext == "jpg" else ext
+    mime = _image_mime(os.path.splitext(path)[1])
 
     with open(path, "rb") as f:
         encoded = base64.b64encode(f.read()).decode("ascii")
 
     return f"data:image/{mime};base64,{encoded}"
+
+
+def event_logo_svg_text(event_id):
+    """SVG-Quelltext eines Event-Logos (für die Anzeige im Canvas-Editor),
+    oder None, wenn es für das Event kein Logo gibt."""
+    path = os.path.join("assets", "svgs", f"{event_id}.svg")
+
+    if not os.path.exists(path):
+        return None
+
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 def save_layer_image(competition_id, layer_id, data_url):
@@ -313,8 +343,7 @@ def parse_design_zip(zip_bytes):
             asset_bytes = assets.get(os.path.basename(layer["path"]))
 
             if asset_bytes:
-                ext = os.path.splitext(layer["path"])[1].lower().lstrip(".") or "png"
-                mime = "jpeg" if ext == "jpg" else ext
+                mime = _image_mime(os.path.splitext(layer["path"])[1])
                 layer["src"] = f"data:image/{mime};base64," + base64.b64encode(asset_bytes).decode("ascii")
 
             layer.pop("path", None)

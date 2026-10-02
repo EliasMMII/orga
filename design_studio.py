@@ -148,6 +148,7 @@ def render_urkunde_design_studio(competition_id):
         initial_layers=design_store.prepare_layers_for_canvas(competition_id, working_design.get("layers", [])),
         font_faces=design_store.build_font_faces(),
         revision=st.session_state[revision_key],
+        event_logo_svg=design_store.event_logo_svg_text(SAMPLE_URKUNDE_CONTEXT["event_id"]),
         key=f"urkunde_canvas__{competition_id}"
     )
 

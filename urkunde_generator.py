@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import math
 import base64
 
 from io import BytesIO
@@ -12,6 +13,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from svglib.svglib import svg2rlg
 from reportlab.graphics import renderPDF
+from reportlab.graphics.shapes import Group, Path, Rect, Polygon, Circle, Ellipse, mmult, transformPoint
 
 import wca_common
 import design_store
@@ -249,7 +251,182 @@ def _recolor_drawing(node, color):
         _recolor_drawing(child, color)
 
 
-def draw_event_logo(c, event_id, center_x, center_y, size=30, color=None):
+def gradient_axis(width, height, angle):
+    """Start-/Endpunkt eines linearen Farbverlaufs über eine Box der Größe
+    width x height, relativ zur Box-Mitte. angle in Grad wie im Canvas-Editor:
+    0 = links nach rechts, 90 = oben nach unten. Rückgabe im PDF-System (y nach oben)."""
+    rad = math.radians(angle or 0)
+    dx, dy = math.cos(rad), math.sin(rad)
+    half = (abs(width * dx) + abs(height * dy)) / 2
+
+    return (-dx * half, dy * half, dx * half, -dy * half)
+
+
+def _gradient_colors(gradient):
+    return (
+        colors.HexColor(gradient.get("from") or "#000000"),
+        colors.HexColor(gradient.get("to") or "#000000")
+    )
+
+
+_ELLIPSE_KAPPA = 0.5522847498
+
+
+def _ellipse_segments(cx, cy, rx, ry):
+    k = _ELLIPSE_KAPPA
+    return [
+        ("m", [(cx + rx, cy)]),
+        ("c", [(cx + rx, cy + k * ry), (cx + k * rx, cy + ry), (cx, cy + ry)]),
+        ("c", [(cx - k * rx, cy + ry), (cx - rx, cy + k * ry), (cx - rx, cy)]),
+        ("c", [(cx - rx, cy - k * ry), (cx - k * rx, cy - ry), (cx, cy - ry)]),
+        ("c", [(cx + k * rx, cy - ry), (cx + rx, cy - k * ry), (cx + rx, cy)]),
+        ("h", []),
+    ]
+
+
+def _shape_segments(node):
+    """Zerlegt eine svglib/reportlab-Form in Pfadsegmente ("m"/"l"/"c"/"h")
+    in ihren eigenen Koordinaten, oder None für nicht füllbare Formen."""
+    if isinstance(node, Path):
+        segments = []
+        points = node.points
+        i = 0
+
+        for op in node.operators:
+            if op == 0:
+                segments.append(("m", [(points[i], points[i + 1])]))
+                i += 2
+            elif op == 1:
+                segments.append(("l", [(points[i], points[i + 1])]))
+                i += 2
+            elif op == 2:
+                segments.append(("c", [(points[i + j], points[i + j + 1]) for j in (0, 2, 4)]))
+                i += 6
+            else:
+                segments.append(("h", []))
+
+        return segments
+
+    if isinstance(node, Rect):
+        x, y, w, h = node.x, node.y, node.width, node.height
+        return [("m", [(x, y)]), ("l", [(x + w, y)]), ("l", [(x + w, y + h)]), ("l", [(x, y + h)]), ("h", [])]
+
+    if isinstance(node, Polygon):
+        pts = list(zip(node.points[0::2], node.points[1::2]))
+
+        if len(pts) < 3:
+            return None
+
+        return [("m", [pts[0]])] + [("l", [pt]) for pt in pts[1:]] + [("h", [])]
+
+    if isinstance(node, Circle):
+        return _ellipse_segments(node.cx, node.cy, node.r, node.r)
+
+    if isinstance(node, Ellipse):
+        return _ellipse_segments(node.cx, node.cy, node.rx, node.ry)
+
+    return None
+
+
+def _transform_segments(segments, matrix):
+    return [(op, [transformPoint(matrix, pt) for pt in pts]) for op, pts in segments]
+
+
+def _collect_filled_shapes(node, matrix, clips, out):
+    """Sammelt rekursiv alle gefüllten Formen eines svglib-Drawings als
+    (clips, segments, fillMode) - Punkte bereits mit matrix transformiert."""
+    if isinstance(node, Group):
+        matrix = mmult(matrix, node.transform)
+        clips = list(clips)
+
+        for child in node.contents:
+            if getattr(child, "isClipPath", 0):
+                segments = _shape_segments(child)
+
+                if segments:
+                    clips.append((_transform_segments(segments, matrix), getattr(child, "fillMode", None)))
+            else:
+                _collect_filled_shapes(child, matrix, clips, out)
+
+        return
+
+    if getattr(node, "fillColor", None) is None:
+        return
+
+    segments = _shape_segments(node)
+
+    if segments:
+        out.append((clips, _transform_segments(segments, matrix), getattr(node, "fillMode", None)))
+
+
+def _clip_to_segments(c, segments, fill_mode):
+    path = c.beginPath()
+
+    for op, pts in segments:
+        if op == "m":
+            path.moveTo(*pts[0])
+        elif op == "l":
+            path.lineTo(*pts[0])
+        elif op == "c":
+            path.curveTo(pts[0][0], pts[0][1], pts[1][0], pts[1][1], pts[2][0], pts[2][1])
+        else:
+            path.close()
+
+    c.clipPath(path, stroke=0, fill=0, fillMode=fill_mode)
+
+
+def draw_svg_drawing(c, drawing, center_x, center_y, width, height, angle=0, color=None, gradient=None):
+    """Zeichnet ein svglib-Drawing in die Box width x height um (center_x,
+    center_y), optional gedreht (angle wie im Canvas-Editor, im Uhrzeigersinn).
+
+    color färbt alle Formen einheitlich ein, gradient ({"from", "to", "angle"})
+    legt einen durchgehenden linearen Farbverlauf über das ganze Logo - beides
+    bleibt Vektorgrafik. Ohne beides werden die Originalfarben gezeichnet.
+    """
+    scale_x = width / drawing.width
+    scale_y = height / drawing.height
+
+    c.saveState()
+    c.translate(center_x, center_y)
+
+    if angle:
+        c.rotate(-angle)
+
+    shapes = []
+
+    if gradient:
+        base_matrix = (scale_x, 0, 0, scale_y, -width / 2, -height / 2)
+        _collect_filled_shapes(drawing, base_matrix, [], shapes)
+
+    if shapes:
+        x0, y0, x1, y1 = gradient_axis(width, height, gradient.get("angle", 0))
+        gradient_colors = _gradient_colors(gradient)
+
+        # Jede Form einzeln als Clip-Pfad setzen und darin denselben Verlauf
+        # zeichnen - ergibt einen durchgehenden Verlauf über das ganze Logo.
+        for clips, segments, fill_mode in shapes:
+            c.saveState()
+
+            for clip_segments, clip_fill_mode in clips:
+                _clip_to_segments(c, clip_segments, clip_fill_mode)
+
+            _clip_to_segments(c, segments, fill_mode)
+            c.linearGradient(x0, y0, x1, y1, gradient_colors, extend=True)
+            c.restoreState()
+    else:
+        # Ohne füllbare Formen (z. B. reine Linien-SVGs) ersatzweise einfarbig.
+        solid = color or (gradient.get("from") if gradient else None)
+
+        if solid:
+            _recolor_drawing(drawing, colors.HexColor(solid))
+
+        drawing.scale(scale_x, scale_y)
+        renderPDF.draw(drawing, c, -width / 2, -height / 2)
+
+    c.restoreState()
+
+
+def draw_event_logo(c, event_id, center_x, center_y, size=30, color=None, gradient=None, angle=0):
     svg_path = os.path.join(SVG_DIR, f"{event_id}.svg")
 
     if not os.path.exists(svg_path):
@@ -262,28 +439,35 @@ def draw_event_logo(c, event_id, center_x, center_y, size=30, color=None):
         if not drawing:
             return
 
-        if color:
-            _recolor_drawing(drawing, colors.HexColor(color))
-
         scale = min(
             size / drawing.width,
             size / drawing.height
         )
 
-        drawing.scale(scale, scale)
-
-        width = drawing.width * scale
-        height = drawing.height * scale
-
-        renderPDF.draw(
-            drawing,
-            c,
-            center_x - width / 2,
-            center_y - height / 2
+        draw_svg_drawing(
+            c, drawing, center_x, center_y,
+            drawing.width * scale, drawing.height * scale,
+            angle=angle, color=color, gradient=gradient
         )
 
     except Exception as e:
         print(f"WARNUNG: Event-Logo konnte nicht geladen werden: {e}")
+
+
+def _load_svg_layer_drawing(layer):
+    """Lädt einen SVG-Bild-Layer als svglib-Drawing, oder None, wenn der
+    Layer kein SVG ist (dann wird er als normales Rasterbild gezeichnet)."""
+    path = layer.get("path")
+    src = str(layer.get("src", ""))
+
+    if path and path.lower().endswith(".svg") and os.path.exists(path):
+        return svg2rlg(path)
+
+    if src.startswith("data:image/svg"):
+        svg_bytes, _ = design_store.data_url_to_bytes(src)
+        return svg2rlg(BytesIO(svg_bytes))
+
+    return None
 
 
 def _safe_set_font(c, font_name, font_size):
@@ -362,10 +546,26 @@ def render_urkunde_overlay(design, context):
 
         if layer_type == "event_logo":
             size = max(width, height) or 26
-            draw_event_logo(c, event_id, box_center_x, box_center_y_pdf, size, color=layer.get("color"))
+            draw_event_logo(
+                c, event_id, box_center_x, box_center_y_pdf, size,
+                color=layer.get("color"), gradient=layer.get("gradient"), angle=angle
+            )
             continue
 
         if layer_type == "image":
+            try:
+                svg_drawing = _load_svg_layer_drawing(layer)
+            except Exception as e:
+                svg_drawing = None
+                print(f"WARNUNG: SVG-Layer konnte nicht geladen werden: {e}")
+
+            if svg_drawing:
+                draw_svg_drawing(
+                    c, svg_drawing, box_center_x, box_center_y_pdf, width, height,
+                    angle=angle, color=layer.get("color"), gradient=layer.get("gradient")
+                )
+                continue
+
             image_source = None
 
             if layer.get("path") and os.path.exists(layer["path"]):
@@ -422,8 +622,9 @@ def render_urkunde_overlay(design, context):
         elif align == "right":
             anchor_x = x + width
 
-        _safe_set_font(c, font_name, font_size)
-        c.setFillColor(colors.HexColor(layer.get("color", "#000000")))
+        font_name = _safe_set_font(c, font_name, font_size)
+        c.setFillColor(colors.HexColor(layer.get("color") or "#000000"))
+        gradient = layer.get("gradient")
 
         c.saveState()
         c.translate(box_center_x, box_center_y_pdf)
@@ -431,7 +632,29 @@ def render_urkunde_overlay(design, context):
             c.rotate(-angle)
         c.translate(anchor_x - box_center_x, baseline_pdf_y - box_center_y_pdf)
 
-        if align == "center":
+        if gradient:
+            # Text als Clip-Pfad setzen (Textmodus 7) und den Verlauf über
+            # die tatsächliche Textbreite hineinzeichnen.
+            text_width = c.stringWidth(text, font_name, font_size)
+            text_x = {"center": -text_width / 2, "right": -text_width}.get(align, 0)
+            text_bottom = -0.25 * font_size
+            text_height = 1.1 * font_size
+
+            text_object = c.beginText(text_x, 0)
+            text_object.setFont(font_name, font_size)
+            text_object.setTextRenderMode(7)
+            text_object.textOut(text)
+            c.drawText(text_object)
+
+            x0, y0, x1, y1 = gradient_axis(text_width, text_height, gradient.get("angle", 0))
+            mid_x = text_x + text_width / 2
+            mid_y = text_bottom + text_height / 2
+
+            c.linearGradient(
+                mid_x + x0, mid_y + y0, mid_x + x1, mid_y + y1,
+                _gradient_colors(gradient), extend=True
+            )
+        elif align == "center":
             c.drawCentredString(0, 0, text)
         elif align == "right":
             c.drawRightString(0, 0, text)

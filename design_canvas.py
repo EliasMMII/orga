@@ -7,7 +7,7 @@ _COMPONENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "desig
 _design_canvas = components.declare_component("design_canvas", path=_COMPONENT_DIR)
 
 
-def design_canvas(page_width, page_height, background_data_url, initial_layers, font_faces, revision, key=None):
+def design_canvas(page_width, page_height, background_data_url, initial_layers, font_faces, revision, event_logo_svg=None, key=None):
     """Rendert den freien Drag-and-Drop-Design-Editor (Fabric.js-Canvas).
 
     Gibt {"layers": [...]} zurück, sobald der Nutzer im Editor etwas ändert
@@ -17,6 +17,9 @@ def design_canvas(page_width, page_height, background_data_url, initial_layers, 
     mit neuen initial_layers neu aufgebaut wird (z. B. nach Reset/Import) -
     bei gleicher revision bleibt der aktuelle Bearbeitungsstand im Browser
     über Streamlit-Reruns hinweg erhalten.
+
+    event_logo_svg ist der SVG-Quelltext eines Beispiel-Event-Logos, das der
+    Editor anstelle eines Platzhalters für Event-Logo-Elemente anzeigt.
     """
     return _design_canvas(
         pageWidth=page_width,
@@ -24,6 +27,7 @@ def design_canvas(page_width, page_height, background_data_url, initial_layers, 
         backgroundDataUrl=background_data_url,
         initialLayers=initial_layers,
         fontFaces=font_faces,
+        eventLogoSvg=event_logo_svg,
         revision=revision,
         key=key,
         default=None
